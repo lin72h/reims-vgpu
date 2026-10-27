@@ -48,14 +48,16 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
 ### x86-64 guest on Linux (KVM)
 
 1. **Host prep.** You need KVM (`/dev/kvm`) and a Vulkan driver; `reims-ctl gpus` lists the GPUs a
-   VM can be given. The library's views of guest memory take a kernel mapping for each run of
-   guest pages, so raise `vm.max_map_count`: `sudo sysctl -w vm.max_map_count=2097152` covers a
-   guest of up to 30 GiB, and a file in `/etc/sysctl.d` keeps it. `scripts/install-ctl.sh` and
-   `reims-ctl` warn when it is too low.
+   VM can be given. The guest's memory reaches the GPU through `/dev/udmabuf`, whatever your GPU,
+   so you need to be able to open it: without it the guest can crash at higher resolutions, at 4K
+   even at its desktop. That means being in the group that owns it (usually `kvm`, the same group
+   as `/dev/kvm`); a desktop session may let you open it anyway, but a VM started over ssh needs
+   the group. `scripts/install-ctl.sh` offers to add you, and `reims-ctl` warns when you can't.
 
-   On an AMD GPU, the guest's memory reaches the GPU through `/dev/udmabuf`, so you need to be in
-   the group that owns it (`kvm` on Ubuntu, the same group as `/dev/kvm`). `reims-ctl` warns when a
-   VM on an AMD GPU can't open it.
+   On an NVIDIA GPU, raising `vm.max_map_count` makes things faster: past a point the GPU gets
+   copies of the guest's memory instead of the memory itself. `reims-ctl doctor` and the
+   installer tell you the value that avoids the copies, if yours is lower. It's optional: the
+   guest works at your distribution's default.
 
 2. **Create a VM.** Run `reims-ctl`, press `n`, pick a macOS version and press Ctrl-S. It downloads
    the installer from Apple and makes the VM's OpenCore image and disk; then press `s` to start it.

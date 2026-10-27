@@ -266,18 +266,47 @@ else
   if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     warn "/dev/kvm is not usable by you: enable virtualization in the firmware and add yourself to the kvm group (sudo usermod -aG kvm \$USER; log in again), or VMs will not start"
   fi
-  # A new VM gets half the host's memory, 4 to 16 GiB, and its views of guest
-  # memory take about 64 mappings per MiB (reims-ctl's runtime::max_map_count).
+  # The guest's memory reaches the GPU through /dev/udmabuf, on every GPU: without
+  # it the library's views of that memory take a kernel mapping per 4 KiB page,
+  # past vm.max_map_count at 4K even at the guest's desktop (reims-ctl's
+  # runtime::udmabuf_problem, docs/qemu.md "Linux hosts: vm.max_map_count").
+  why="the guest's memory reaches the GPU through it, and without it the guest can crash at higher resolutions, at 4K even at its desktop"
+  udmabuf=0
+  if [[ ! -e /dev/udmabuf ]]; then
+    warn "there's no /dev/udmabuf: $why. Load it with sudo modprobe udmabuf, and put udmabuf in a file in /etc/modules-load.d to keep it"
+  else
+    group="$(stat -c %G /dev/udmabuf)"
+    if [[ -r /dev/udmabuf && -w /dev/udmabuf ]]; then
+      udmabuf=1
+      if [[ $group != root ]] && ! id -nG | tr ' ' '\n' | grep -qx "$group"; then
+        say "You can open /dev/udmabuf in this session, but you're not in its $group group: over ssh, where a desktop session's access doesn't apply, add yourself to it (sudo usermod -aG $group \$USER) to start VMs there"
+      fi
+    elif [[ $group == root ]]; then
+      warn "only root can open /dev/udmabuf: $why. Give it to the kvm group with a udev rule, a file in /etc/udev/rules.d holding KERNEL==\"udmabuf\", GROUP=\"kvm\", MODE=\"0660\", add yourself to kvm (sudo usermod -aG kvm \$USER), and restart"
+    else
+      say "You can't open /dev/udmabuf: $why. You need its $group group"
+      if ask "Add you to the $group group with sudo usermod?"; then
+        sudo usermod -aG "$group" "$USER"
+        say "Added you to $group: log in again for it to take effect"
+      else
+        warn "add yourself to the $group group (sudo usermod -aG $group \$USER) and log in again, or the guest can crash at higher resolutions"
+      fi
+    fi
+  fi
+  # With udmabuf, vm.max_map_count is only a speed-up, on NVIDIA: a view of an
+  # x86-64 guest's memory takes a mapping per 4 KiB page there, and past the
+  # library's budget (the limit less 16,384 and 8,192) its buffers are copied,
+  # which works and is slower (reims-ctl's runtime::max_map_count). A new VM
+  # gets half the host's memory, 4 to 16 GiB.
   maps="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
   vm_mib=$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) / 2 / 1048576 * 1024))
   vm_mib=$((vm_mib < 4096 ? 4096 : vm_mib > 16384 ? 16384 : vm_mib))
-  if ((maps < vm_mib * 64 + 81920)); then
-    warn "vm.max_map_count is $maps: a new VM's $((vm_mib / 1024)) GiB needs about $((vm_mib * 64 + 81920)) (sudo sysctl -w vm.max_map_count=2097152, and a file in /etc/sysctl.d to keep it)"
-  fi
-  # An AMD GPU (RADV) imports the guest's memory as dma-bufs made by udmabuf
-  # (docs/qemu.md, "Linux hosts: AMD GPUs and udmabuf").
-  if grep -qsx 0x1002 /sys/class/drm/*/device/vendor && [[ ! -r /dev/udmabuf || ! -w /dev/udmabuf ]]; then
-    warn "/dev/udmabuf is not usable by you: a VM on an AMD GPU needs it for the guest's memory (add yourself to the group that owns it, kvm on Ubuntu: sudo usermod -aG kvm \$USER; log in again)"
+  want=$((vm_mib * 256 + 24576))
+  if ((udmabuf && maps < want)) && grep -qsx 0x10de /sys/class/drm/*/device/vendor; then
+    raise=1048576
+    while ((raise < want)); do raise=$((raise * 2)); done
+    uncopied=$((maps > 24576 ? (maps - 24576) / 256 : 0))
+    say "vm.max_map_count is $maps: on an NVIDIA GPU, past about $uncopied MiB of a new VM's $((vm_mib / 1024)) GiB the GPU gets copies of its memory, which is slower; sudo sysctl -w vm.max_map_count=$raise, and a file in /etc/sysctl.d to keep it, avoids them"
   fi
 fi
 

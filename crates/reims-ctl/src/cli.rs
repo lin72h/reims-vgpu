@@ -1217,8 +1217,15 @@ fn doctor(host: Host) -> Result<i32> {
                     ),
                 },
             );
+            let udmabuf = runtime::udmabuf_problem();
+            line(
+                udmabuf.is_none(),
+                "/dev/udmabuf",
+                udmabuf.clone().unwrap_or_else(|| "usable".into()),
+            );
             if let Some(n) = runtime::host_max_map_count() {
-                // Enough for the largest VM, or a new one.
+                // A speed-up only, on NVIDIA where udmabuf opens (runtime::max_map_count): for
+                // the largest VM, or a new one.
                 let memory_mib = Registry::load()
                     .map(|reg| {
                         reg.vms
@@ -1230,18 +1237,15 @@ fn doctor(host: Host) -> Result<i32> {
                     })
                     .unwrap_or(0)
                     .max(create::default_memory_mib());
-                let (want, raise) = runtime::max_map_count(memory_mib);
+                let note = (udmabuf.is_none() && runtime::host_has_nvidia())
+                    .then(|| runtime::map_count_note(n, memory_mib))
+                    .flatten();
                 line(
-                    n >= want,
+                    true,
                     "vm.max_map_count",
-                    if n >= want {
-                        n.to_string()
-                    } else {
-                        format!(
-                            "{n}: a {} GiB guest needs about {want}: sudo sysctl -w \
-                             vm.max_map_count={raise}, and a file in /etc/sysctl.d to keep it",
-                            memory_mib / 1024
-                        )
+                    match note {
+                        Some(note) => format!("{n}: {note}"),
+                        None => n.to_string(),
                     },
                 );
             }

@@ -163,13 +163,114 @@ pub fn host_max_map_count() -> Option<u64> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-/// The `vm.max_map_count` a guest of `memory_mib` needs on Linux, and the value to suggest
-/// raising it to. docs/qemu.md, "Linux hosts: vm.max_map_count": guest memory views take a
-/// mapping per run of 16 KiB pages; the stock 65,530 holds about 770 MiB of them.
+/// The `vm.max_map_count` at which an NVIDIA GPU takes all of a guest of `memory_mib` without
+/// copies, and the value to suggest raising it to; scripts/install-ctl.sh keeps the same rule.
+/// docs/qemu.md, "Linux hosts: vm.max_map_count": a view of an x86-64 guest's memory mapped from
+/// its files takes a mapping per 4 KiB page, which a GPU that pins a pointer's pages (NVIDIA's)
+/// needs; past the library's budget, the limit less 16,384 kept for the rest of the process and
+/// 8,192 more, its buffers are copied instead, which works and is slower. Other GPUs take the
+/// views through udmabuf, a mapping per 4 MiB, so the limit is only a speed-up, and only there.
 pub fn max_map_count(memory_mib: u64) -> (u64, u64) {
-    let want = (memory_mib * 64).max(262_144) + 16_384 + 65_536;
-    // 2097152 covers a guest of up to 30 GiB, a new VM's default of up to 16 GiB among them.
-    (want, want.next_power_of_two().max(2_097_152))
+    let want = memory_mib * 256 + 16_384 + 8_192;
+    (want, want.next_power_of_two().max(1 << 20))
+}
+
+/// What keeps the library from opening `/dev/udmabuf`, which every Linux host needs: the guest's
+/// memory reaches the GPU through it, and without it the library's views of that memory take a
+/// kernel mapping per 4 KiB page, past `vm.max_map_count` at 3840 x 2160 even at the guest's
+/// desktop (docs/qemu.md, "Linux hosts: vm.max_map_count"). None where it opens.
+pub fn udmabuf_problem() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    const NODE: &str = "/dev/udmabuf";
+    let e = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(NODE)
+        .err()?;
+    let group = std::fs::metadata(NODE).ok().map(|m| m.gid());
+    let over_ssh = std::env::var_os("SSH_CONNECTION").is_some();
+    Some(udmabuf_message(
+        &e,
+        group.map(|gid| (gid, group_name(gid))),
+        over_ssh,
+    ))
+}
+
+/// The name of group `gid`, from /etc/group, else its number.
+fn group_name(gid: u32) -> String {
+    std::fs::read_to_string("/etc/group")
+        .ok()
+        .and_then(|groups| group_in(&groups, gid))
+        .unwrap_or_else(|| gid.to_string())
+}
+
+/// The name `groups`, in /etc/group's form, gives group `gid`.
+fn group_in(groups: &str, gid: u32) -> Option<String> {
+    groups.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        (f.nth(1)?.parse() == Ok(gid)).then(|| name.to_owned())
+    })
+}
+
+/// [`udmabuf_problem`]'s message for `e`, the node's group (its id and name) where it exists, and
+/// whether reims-ctl runs over ssh.
+fn udmabuf_message(e: &std::io::Error, group: Option<(u32, String)>, over_ssh: bool) -> String {
+    const WHY: &str = "the guest's memory reaches the GPU through it, and without it the guest \
+                       can crash at higher resolutions, at 4K even at its desktop";
+    let load = "Load it with sudo modprobe udmabuf, and put udmabuf in a file in \
+                /etc/modules-load.d to keep it";
+    let Some((gid, name)) = group else {
+        return format!("There's no /dev/udmabuf: {WHY}. {load}");
+    };
+    if e.kind() != std::io::ErrorKind::PermissionDenied {
+        return format!("/dev/udmabuf doesn't open ({e}): {WHY}. {load}");
+    }
+    if gid == 0 {
+        return format!(
+            "Only root can open /dev/udmabuf ({e}): {WHY}. Give it to the kvm group with a udev \
+             rule, a file in /etc/udev/rules.d holding KERNEL==\"udmabuf\", GROUP=\"kvm\", \
+             MODE=\"0660\", add yourself to kvm (sudo usermod -aG kvm $USER), and restart"
+        );
+    }
+    let ssh = if over_ssh {
+        ". Over ssh, the access a desktop session gets to it doesn't apply, so you need the \
+         group there"
+    } else {
+        ""
+    };
+    format!(
+        "You can't open /dev/udmabuf ({e}): {WHY}. Add yourself to the {name} group that owns it \
+         (sudo usermod -aG {name} $USER) and log in again{ssh}"
+    )
+}
+
+/// Whether the host has an NVIDIA GPU (Linux): a card of its PCI vendor id.
+pub fn host_has_nvidia() -> bool {
+    std::fs::read_dir("/sys/class/drm")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|card| std::fs::read_to_string(card.path().join("device/vendor")).ok())
+        .any(|v| v.trim() == "0x10de")
+}
+
+/// What `vm.max_map_count` costs a host whose GPU is NVIDIA's, for `reims-ctl doctor`: where
+/// `/dev/udmabuf` opens (else [`udmabuf_problem`] says what to do) and the limit falls short of
+/// [`max_map_count`] for a guest of `memory_mib`, how much of it stays uncopied and the value
+/// that keeps all of it so. A speed-up only: the guest works either way.
+pub fn map_count_note(n: u64, memory_mib: u64) -> Option<String> {
+    let (want, raise) = max_map_count(memory_mib);
+    if n >= want {
+        return None;
+    }
+    let uncopied = n.saturating_sub(16_384 + 8_192) / 256;
+    Some(format!(
+        "on an NVIDIA GPU, past about {uncopied} MiB of a {} GiB guest's memory the GPU gets \
+         copies of it, which is slower; sudo sysctl -w vm.max_map_count={raise}, and a file in \
+         /etc/sysctl.d to keep it, avoids them",
+        memory_mib / 1024
+    ))
 }
 
 /// How to install macOS in an x86-64 VM that has an installer, for the CLI and the interface's
@@ -234,56 +335,12 @@ pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
             ));
         }
     }
-    if host.os == Os::Linux {
-        if let Some(n) = host_max_map_count() {
-            let (want, raise) = max_map_count(vm.config.memory_mib);
-            if n < want {
-                w.push(format!(
-                    "vm.max_map_count is {n}: a {} GiB guest needs about {want}. Raise it with \
-                     sudo sysctl -w vm.max_map_count={raise} (and in /etc/sysctl.d to keep it)",
-                    vm.config.memory_mib / 1024
-                ));
-            }
-        }
-        // docs/qemu.md, "Linux hosts: AMD GPUs and udmabuf": RADV imports the guest's memory as
-        // dma-bufs udmabuf makes.
-        if may_run_on_radv(&vm.config.gpu) {
-            let usable = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/udmabuf");
-            if let Err(e) = usable {
-                w.push(format!(
-                    "/dev/udmabuf cannot be opened ({e}): an AMD GPU needs it for the guest's \
-                     memory, or the guest dies at boot. Add yourself to the group that owns it \
-                     (kvm on Ubuntu; sudo usermod -aG kvm $USER, then log in again)"
-                ));
-            }
-        }
+    if host.os == Os::Linux
+        && let Some(problem) = udmabuf_problem()
+    {
+        w.push(problem);
     }
     w
-}
-
-/// Whether a VM may run on RADV, Mesa's driver for AMD GPUs: its GPU is one, or none is set and
-/// the host has an AMD GPU and no NVIDIA one, which the library would pick first as discrete.
-fn may_run_on_radv(gpu: &crate::vm::Gpu) -> bool {
-    let radv = |file: &Path| {
-        file.file_name()
-            .is_some_and(|f| f.to_string_lossy().starts_with("radeon_icd"))
-    };
-    match &gpu.driver_file {
-        Some(file) => radv(file) || gpu.name.as_deref().is_some_and(|n| n.contains("RADV")),
-        None => {
-            let vendors: Vec<String> = std::fs::read_dir("/sys/class/drm")
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|card| std::fs::read_to_string(card.path().join("device/vendor")).ok())
-                .map(|v| v.trim().to_owned())
-                .collect();
-            vendors.iter().any(|v| v == "0x1002") && !vendors.iter().any(|v| v == "0x10de")
-        }
-    }
 }
 
 /// How many lines of a QEMU log, since the guest's last reset, name an object entry the guest
@@ -673,40 +730,60 @@ pub fn tail(path: &Path, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::Gpu;
-    use std::path::PathBuf;
 
+    /// The limit at which an NVIDIA GPU takes a guest uncopied is a mapping per 4 KiB page of it
+    /// past the library's 16,384 and 8,192, as the library's own line names it
     #[test]
-    fn the_suggested_max_map_count_covers_new_vms() {
-        // A new VM's default is up to 16 GiB; CachyOS's stock 1048576 falls short of it.
-        assert_eq!(max_map_count(16 * 1024), (1_130_496, 2_097_152));
-        assert_eq!(max_map_count(4096), (344_064, 2_097_152));
-        let (want, raise) = max_map_count(30 * 1024);
-        assert!(want <= raise && raise == 2_097_152);
-        assert_eq!(max_map_count(32 * 1024).1, 4_194_304);
+    fn the_suggested_max_map_count_covers_a_guest_in_4k_pages() {
+        assert_eq!(max_map_count(16 * 1024), (4_218_880, 8_388_608));
+        assert_eq!(max_map_count(4096), (1_073_152, 2_097_152));
+        assert_eq!(max_map_count(2048), (548_864, 1_048_576));
+        assert!(map_count_note(8_388_608, 16 * 1024).is_none());
+        let note = map_count_note(65_530, 16 * 1024).unwrap();
+        assert!(
+            note.contains("past about 159 MiB of a 16 GiB guest's memory"),
+            "{note}"
+        );
+        assert!(note.contains("vm.max_map_count=8388608"), "{note}");
     }
 
-    /// A VM pinned to Mesa's radeon driver, or to a GPU named RADV, may run on RADV; one pinned
-    /// to NVIDIA's may not
+    /// The udmabuf message names the group that owns the node, says what to do where root alone
+    /// may open it or there is none, and says why the group is needed over ssh
     #[test]
-    fn a_pinned_gpu_decides_radv() {
-        let gpu = |file: &str, name: &str| Gpu {
-            driver_file: Some(PathBuf::from(file)),
-            device_id: None,
-            name: Some(name.to_owned()),
-        };
-        assert!(may_run_on_radv(&gpu(
-            "/usr/share/vulkan/icd.d/radeon_icd.json",
-            "AMD Radeon 780M Graphics (RADV PHOENIX)"
-        )));
-        assert!(may_run_on_radv(&gpu(
-            "/usr/share/vulkan/icd.d/radeon_icd.x86_64.json",
-            "AMD Radeon 780M Graphics"
-        )));
-        assert!(!may_run_on_radv(&gpu(
-            "/usr/share/vulkan/icd.d/nvidia_icd.json",
-            "NVIDIA GeForce RTX 3090"
-        )));
+    fn the_udmabuf_message_names_the_fix() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let m = udmabuf_message(&denied, Some((992, "kvm".into())), false);
+        assert!(m.contains("crash at higher resolutions"), "{m}");
+        assert!(
+            m.contains("sudo usermod -aG kvm $USER) and log in again"),
+            "{m}"
+        );
+        assert!(!m.contains("ssh"), "{m}");
+        let m = udmabuf_message(&denied, Some((78, "render".into())), true);
+        assert!(m.contains("usermod -aG render"), "{m}");
+        assert!(m.contains("Over ssh"), "{m}");
+        let m = udmabuf_message(&denied, Some((0, "root".into())), false);
+        assert!(
+            m.contains("Only root") && m.contains("GROUP=\"kvm\""),
+            "{m}"
+        );
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(udmabuf_message(&missing, None, false).contains("modprobe udmabuf"));
+        let no_module = std::io::Error::from_raw_os_error(libc::ENODEV);
+        let m = udmabuf_message(&no_module, Some((992, "kvm".into())), false);
+        assert!(
+            m.contains("doesn't open") && m.contains("modprobe udmabuf"),
+            "{m}"
+        );
+    }
+
+    /// A group's name is read from /etc/group's form by its id
+    #[test]
+    fn a_group_is_named_by_its_id() {
+        let groups = "root:x:0:\nkvm:x:992:anees\nrender:x:989:\n";
+        assert_eq!(group_in(groups, 992).as_deref(), Some("kvm"));
+        assert_eq!(group_in(groups, 0).as_deref(), Some("root"));
+        assert_eq!(group_in(groups, 5), None);
     }
 
     /// A VM does not start on a disk another VM, using it in place too, runs on.
