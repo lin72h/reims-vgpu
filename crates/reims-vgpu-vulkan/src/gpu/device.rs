@@ -251,6 +251,8 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     }
     metal_space::count_sampler_ids(&raw);
     crate::answer::native::device_made(raw.properties());
+    #[cfg(target_os = "linux")]
+    crate::os::learn_view_imports(&raw);
     let made = Obj::new(DeviceObject {
         raw,
         registry_id: id,
@@ -628,9 +630,12 @@ impl VulkanDevice {
             // The runtime runs the deallocator as it lets go of the buffer, which may drop the
             // surface's last reference, and frees its import once nothing else holds it.
             let hold = crate::os::surface_memory_hold(surface);
+            // The runtime imports the pages as they are mapped, from their files on Linux where a
+            // device needs them so (`crate::os::import_view`); writable, so no twin.
+            let view = crate::os::import_view(base, length);
             let site = backing::ImportSite::SurfaceBase;
-            let traced = backing::ImportTrace::new(site, base, length, base);
-            (base, backing::keep_alive((hold, traced)))
+            let traced = backing::ImportTrace::new(site, base, length, view.at());
+            (base, backing::keep_alive((hold, view, traced)))
         } else {
             let first = u64::try_from(base.as_ptr().addr())
                 .unwrap_or(u64::MAX)
@@ -2276,7 +2281,8 @@ pub(crate) mod tests {
     /// (`crate::gpu::backing::Alias::into_runtime`): the textures map the guest's pages again
     /// only for that twin, a kernel mapping a run of them, where each took a second view and its
     /// own twin. Counted by the process's mappings of the guest's pages' file, which every view of
-    /// them takes (`/proc/self/maps`). Linux's: on macOS IOSurface maps the surface
+    /// them mapped from it takes (`/proc/self/maps`), a view through dma-bufs none, a twin always
+    /// a mapping a run. Linux's: on macOS IOSurface maps the surface
     #[cfg(target_os = "linux")]
     #[test]
     fn textures_over_a_surface_map_its_pages_once_more_at_most() {
@@ -2343,8 +2349,13 @@ pub(crate) mod tests {
                 ..SurfaceSpec::default()
             };
             assert_eq!(mappings(), 1, "the guest's pages: {direction:?}");
+            // A view through dma-bufs maps none of the file's pages itself.
+            let view = match crate::os::views_through_dma_bufs() {
+                true => 0,
+                false => PAGES,
+            };
             let surface = crate::os::OsSurfaces::new().create(&spec).unwrap();
-            assert_eq!(mappings(), 1 + PAGES, "the view: {direction:?}");
+            assert_eq!(mappings(), 1 + view, "the view: {direction:?}");
             let textures: Vec<_> = (0..2)
                 .map(|_| {
                     d.new_texture_on_surface(&bgra(width, height, 0), Some(&surface), 0)
@@ -2354,7 +2365,7 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(
                 mappings(),
-                1 + PAGES * (1 + twins),
+                1 + view + PAGES * twins,
                 "the view, and a twin of it where read-only: {direction:?}"
             );
             drop((textures, surface));

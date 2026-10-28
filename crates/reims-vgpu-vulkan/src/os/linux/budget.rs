@@ -17,9 +17,23 @@
 //! twins' pieces ([`super::import`]) and the stand-ins' memory ([`super::vm::OwnMemory`]). What it
 //! does not count is the reserve's to cover ([`RESERVE`]).
 //!
+//! Where the library has another way than mappings of its own, it takes it short of the budget,
+//! [`HEADROOM`] below it ([`claim`], [`Reach::ShortOfHeadroom`]): a view a device would need from
+//! its files goes through dma-bufs instead (`super::vm`'s module docs, "Imports of views"). What
+//! has no other way has the headroom to itself: a view through dma-bufs, a range, a twin or a
+//! stand-in, and the pages an import maps from their files ([`Reach::Whole`]).
+//!
+//! What would pass the budget first folds the views' runs mapped from their files that no import
+//! a device may pin holds back into dma-bufs (`super::vm::fold_idle`), a mapping per 4 MiB of
+//! their pages, and weighs again: only where that freed too little does it end the process or
+//! refuse.
+//!
 //! The limit is read when the first view is weighed, and again when one would pass it, as it may
-//! have been raised since. A guest whose RAM in 16 KiB pieces would pass the budget is warned of
-//! when its memory is leased ([`warn_if_short`]), with the setting that raises it.
+//! have been raised since. A guest whose RAM, mapped from its files a mapping a 4 KiB page, would
+//! pass the budget is logged where the budget bites, with the setting that raises it: as its
+//! memory is leased where udmabuf is not the process's, as views past the budget end the process
+//! there ([`warn_if_short`]), and as a device that needs imported pages mapped from their files is
+//! made, as imports past the budget are refused there ([`warn_if_imports_short`]).
 
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -45,9 +59,24 @@ use super::files;
 /// ([`super::vm`]'s `no_space`).
 pub(super) const RESERVE: u64 = 16_384;
 
-/// The piece guest memory comes in for the warning's estimate: 16 KiB, the run nearly every
-/// view of an x86-64 guest's memory was made of when measured (and an arm64 guest's page).
-const GUEST_PIECE: u64 = 0x4000;
+/// The mappings kept below the budget for what has no way but mappings of its own, where the
+/// library chooses a view's or an import's mappings ([`claim`]): views through dma-bufs, each a
+/// mapping per 4 MiB of scattered pages at udmabuf's stock `list_limit` and one at each end
+/// (`super::vm`'s `map_through`), the ranges views are made of, IOSurface stand-ins' memory,
+/// imports' twins, and the pages imports map from their files ([`Reach::Whole`]). A margin,
+/// as [`RESERVE`] is, sized from the views it is for: views through dma-bufs of all of a 16 GiB
+/// guest's pages take 4,096 mappings and two for each view, and the
+/// views held at the 3840 × 2160 death (RTX 5080 Laptop, 16 GiB guest, 2026-10-27), 391 surfaces
+/// over 3.9 GiB, would take about 1,800 through dma-bufs. Claims made at once are weighed together
+/// ([`claim`]), so the headroom need cover none of them.
+pub(super) const HEADROOM: u64 = 8_192;
+
+/// The piece guest memory comes in for the warnings' estimate: 4 KiB. An x86-64 macOS guest
+/// hands out its pages in 16 KiB clumps laid backwards, so a view of them mapped from their files
+/// takes a mapping a 4 KiB page (`super::vm`'s module docs, "Views through dma-bufs"): every view
+/// where udmabuf is not the process's, and where a device needs imported pages mapped from their
+/// files ("Imports of views").
+const GUEST_PIECE: u64 = 0x1000;
 
 /// `vm.max_map_count` as last read; 0 before the first read.
 static LIMIT: AtomicU64 = AtomicU64::new(0);
@@ -107,6 +136,9 @@ fn budget(limit: u64) -> u64 {
 /// The import twins' mappings.
 static TWIN_MAPPINGS: AtomicU64 = AtomicU64::new(0);
 
+/// The mappings claimed ([`claim`]) and not yet counted where they are made.
+static CLAIMED: AtomicU64 = AtomicU64::new(0);
+
 /// The IOSurface stand-ins' mappings of their own memory.
 static OWN_MAPPINGS: AtomicU64 = AtomicU64::new(0);
 
@@ -136,69 +168,173 @@ pub(super) fn held() -> u64 {
         .saturating_add(OWN_MAPPINGS.load(Ordering::Relaxed))
 }
 
-/// Lets `what` add up to `adding` mappings, or ends the process where the views would pass the
-/// budget with them, at the limit read again (module docs): the death names `what`, the
-/// mappings the views hold and the process holds, the limit, the reserve and the setting that
-/// gives room. Threads that weigh views at once may pass it by what they add between them, which
-/// the reserve covers.
-pub(super) fn admit(adding: u64, what: &'static str) {
-    let held = held();
+/// Whether the views may add `adding` mappings to those they hold and those claimed within the
+/// budget less `kept`, at the limit read again where they would pass it as last read: the
+/// mappings held and claimed, and the limit, where they may not.
+fn weigh(adding: u64, kept: u64) -> Result<(), (u64, u64)> {
+    let held = held().saturating_add(CLAIMED.load(Ordering::Acquire));
     let wanted = held.saturating_add(adding);
-    if wanted <= budget(limit()) {
-        return;
+    if wanted <= budget(limit()).saturating_sub(kept) {
+        return Ok(());
     }
     let limit = reread();
-    if wanted <= budget(limit) {
+    if wanted <= budget(limit).saturating_sub(kept) {
+        return Ok(());
+    }
+    Err((held, limit))
+}
+
+/// Mappings claimed for something the library makes, given back as it drops, which is once they
+/// are counted where they are made, or once they are not to be.
+#[must_use]
+pub(super) struct Claim(u64);
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        // Release: whoever claims after this sees what the claim was counted as.
+        CLAIMED.fetch_sub(self.0, Ordering::Release);
+    }
+}
+
+/// How far into the budget a [`claim`] may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Reach {
+    /// Short of it by [`HEADROOM`]: for what has another way than mappings of its own, which it
+    /// takes past that (module docs).
+    ShortOfHeadroom,
+    /// All of it, the headroom included: for what has no other way, an import's pages a device
+    /// pins as they are mapped (`super::import`'s `no_room_to_unfold`).
+    Whole,
+}
+
+/// Claims `adding` mappings, where they fit as far into the budget as `reach` lets them with
+/// those held and claimed, at the limit read again where they would not as last read; `None`
+/// where they do not, and the caller takes its other way, or refuses. Claims made at once are
+/// weighed together: each counts itself before it weighs, so the last of them to weigh sees the
+/// others, and a claim never lets two pass that do not fit together.
+pub(super) fn claim(adding: u64, reach: Reach) -> Option<Claim> {
+    // Acquire: a claim given back before this one counts sees the mappings it was counted as.
+    CLAIMED.fetch_add(adding, Ordering::AcqRel);
+    let claim = Claim(adding);
+    let kept = match reach {
+        Reach::ShortOfHeadroom => HEADROOM,
+        Reach::Whole => 0,
+    };
+    weigh(0, kept).is_ok().then_some(claim)
+}
+
+/// Lets `what` add up to `adding` mappings, or ends the process where the views would pass the
+/// budget with them, at the limit read again, though the views no import holds were folded back
+/// into dma-bufs (`super::vm::fold_idle`) (module docs): the death names `what`, the mappings
+/// the views hold and the process holds, the limit, the reserve and the setting that gives room.
+/// Threads that weigh views at once may pass it by what they add between them, which the
+/// reserve covers.
+pub(super) fn admit(adding: u64, what: &'static str) {
+    if weigh(adding, 0).is_ok() {
         return;
     }
+    super::vm::fold_idle();
+    let Err((held, limit)) = weigh(adding, 0) else {
+        return;
+    };
+    die(what, adding, held, limit, 0)
+}
+
+/// Ends the process where `what`, which has no other way than `adding` mappings of its own, was
+/// refused them by [`claim`] reaching the whole budget, in strict mode, where its refusal would
+/// be the runtime's: [`admit`]'s death.
+pub(super) fn exhausted_whole(adding: u64, what: &'static str) -> ! {
+    let held = held().saturating_add(CLAIMED.load(Ordering::Acquire));
+    die(what, adding, held, reread(), 0)
+}
+
+/// [`admit`]'s death, `kept` mappings short of the budget.
+fn die(what: &str, adding: u64, held: u64, limit: u64, kept: u64) -> ! {
     let (mappings, _) = super::vm::map_census();
     fatal_with_detail(
         DeathId::Platform {
             kind: DeathKind::Abort,
             call: "mmap",
         },
-        &exhausted(what, adding, held, limit, &mappings),
+        &exhausted(what, adding, held, limit, kept, &mappings),
     )
 }
 
 /// The line of [`admit`]'s death: `what` would add `adding` mappings to the `held` the views hold
-/// under `limit`, the process holding `mappings`.
-fn exhausted(what: &str, adding: u64, held: u64, limit: u64, mappings: &str) -> String {
+/// under `limit`, `kept` short of the budget, the process holding `mappings`.
+fn exhausted(what: &str, adding: u64, held: u64, limit: u64, kept: u64, mappings: &str) -> String {
     let room = held
         .saturating_add(adding)
         .saturating_add(RESERVE)
+        .saturating_add(kept)
         .next_power_of_two()
         .max(1 << 20);
+    let short = match kept {
+        0 => String::new(),
+        kept => format!(" and the {kept} kept for what has no other way"),
+    };
     format!(
         "the library's views of memory ran out of kernel mappings: {what} would add up to \
          {adding} to the {held} they hold, past their budget of {}, {SETTING} {limit} less the \
-         {RESERVE} kept for the rest of the process (which holds {mappings} in all); Metal's call \
-         goes on where macOS has no such limit, and `sysctl -w {SETTING}={room}` or more gives \
-         room",
-        budget(limit),
+         {RESERVE} kept for the rest of the process (which holds {mappings} in all){short}; \
+         Metal's call goes on where macOS has no such limit, and `sysctl -w {SETTING}={room}` or \
+         more gives room",
+        budget(limit).saturating_sub(kept),
     )
 }
 
-/// Warns once, as a guest's RAM of `guest_ram` bytes is leased, where views of all of it in
-/// 16 KiB pieces would pass the budget: past that much of it, a view ends the process
-/// ([`admit`]).
+/// The guest's RAM, as it was leased ([`warn_if_short`]).
+static GUEST_RAM: AtomicU64 = AtomicU64::new(0);
+
+/// Warns once, as a guest's RAM of `guest_ram` bytes is leased, where udmabuf is not the
+/// process's and views of all of it mapped from its files, in 4 KiB pieces, would pass the
+/// budget: past that much of it, a view ends the process ([`admit`]). Where udmabuf is, a view
+/// past the budget is mapped through dma-bufs instead, and [`warn_if_imports_short`] warns of
+/// what that costs, here where its device was made before the lease.
 pub(super) fn warn_if_short(guest_ram: u64) {
+    GUEST_RAM.store(guest_ram, Ordering::Relaxed);
+    if !super::dma_buf::opens() {
+        short("views of guest memory end the process", 0, log::Level::Warn);
+    } else if super::import::imports_need_files() {
+        warn_if_imports_short();
+    }
+}
+
+/// Tells once, where a device of the process needs imported pages mapped from their files
+/// (`super::import`'s `learn_view_imports`) and imports of all of the guest's RAM, in 4 KiB pieces,
+/// would pass the budget: past that much of it, an import is handed over as mapped, which such a
+/// device refuses (`super::import`'s `no_room_to_unfold`). Nothing before the guest's RAM is
+/// leased ([`warn_if_short`] warns then).
+pub(super) fn warn_if_imports_short() {
+    short("imports of guest memory are refused", 0, log::Level::Warn);
+}
+
+/// The line of [`warn_if_short`] and [`warn_if_imports_short`], once for the process at
+/// `level`, where the guest's RAM in 4 KiB pieces would pass the budget less `kept`: past it,
+/// `what`.
+fn short(what: &str, kept: u64, level: log::Level) {
+    let guest_ram = GUEST_RAM.load(Ordering::Relaxed);
     let limit = reread();
+    let line = budget(limit).saturating_sub(kept);
     let needed = guest_ram / GUEST_PIECE;
-    if needed <= budget(limit) {
+    if needed <= line {
         return;
     }
     static WARNED: Once = Once::new();
     WARNED.call_once(|| {
-        let mib = budget(limit).saturating_mul(GUEST_PIECE) >> 20;
-        log::warn!(
+        let mib = line.saturating_mul(GUEST_PIECE) >> 20;
+        log::log!(
             target: "reims_vgpu_vulkan::os",
-            "{SETTING} is {limit}: views of guest memory end the process past {} mappings, about \
-             {mib} MiB of the guest's {} MiB in 16 KiB pieces; `sysctl -w {SETTING}={}` or more \
-             lets them cover it",
-            budget(limit),
+            level,
+            "{SETTING} is {limit}: {what} past {line} mappings, about {mib} MiB of the guest's {} \
+             MiB mapped from their files in 4 KiB pieces; `sysctl -w {SETTING}={}` or more lets \
+             them cover it",
             guest_ram >> 20,
-            needed.saturating_add(RESERVE).next_power_of_two().max(1 << 20),
+            needed
+                .saturating_add(RESERVE)
+                .saturating_add(kept)
+                .next_power_of_two()
+                .max(1 << 20),
         );
     });
 }
@@ -263,8 +399,8 @@ mod tests {
         assert!(v.deallocate(src, 64 * PAGE).is_success());
     }
 
-    /// A range a view can be made of, an import's twin and an IOSurface stand-in's memory end
-    /// the process past the budget too; with room, the twin is made
+    /// A range a view can be made of, an import's twin and an IOSurface stand-in's memory end the
+    /// process past the budget too; with room, the twin is made
     #[test]
     fn ranges_twins_and_stand_ins_past_the_budget_die() {
         let v = LinuxVm::new();
@@ -277,7 +413,11 @@ mod tests {
             assert!(dies_at_the_budget(|| import::import_view(p, PAGE)));
             assert!(dies_at_the_budget(|| vm::OwnMemory::new(PAGE)));
         }
-        assert_ne!(import::import_view(p, PAGE).at(), p, "a twin with room");
+        assert_ne!(
+            import::import_view(p, PAGE).at(),
+            p,
+            "a twin with room"
+        );
         assert!(v.deallocate(at, 2 * PAGE).is_success());
     }
 
@@ -285,7 +425,7 @@ mod tests {
     /// with room
     #[test]
     fn the_death_names_the_numbers() {
-        let line = exhausted("a view of guest pages", 3, 49_140, 65_530, "52000");
+        let line = exhausted("a view of guest pages", 3, 49_140, 65_530, 0, "52000");
         for part in [
             "ran out of kernel mappings",
             "a view of guest pages would add up to 3 to the 49140 they hold",
@@ -295,6 +435,61 @@ mod tests {
         ] {
             assert!(line.contains(part), "{part}: {line}");
         }
+        let line = exhausted("an import's view", 3, 40_000, 65_530, HEADROOM, "52000");
+        for part in [
+            "past their budget of 40954, vm.max_map_count 65530 less the 16384 kept",
+            "(which holds 52000 in all) and the 8192 kept for what has no other way;",
+        ] {
+            assert!(line.contains(part), "{part}: {line}");
+        }
+    }
+
+    /// A view past the budget folds the views no import holds back into dma-bufs first, and is
+    /// let through where that freed room; where it freed too little, it dies
+    #[test]
+    fn a_view_past_the_budget_folds_the_idle_views_first() {
+        if !super::super::dma_buf::opens() {
+            return;
+        }
+        let v = LinuxVm::new();
+        let n = 64;
+        let src = vm::allocate_aliasable(n * PAGE).unwrap();
+        let at = v.allocate_anywhere(n * PAGE).unwrap();
+        // Backwards, a remap and a mapping a page.
+        for i in 0..n {
+            let (to, from) = (
+                at.wrapping_add(i * PAGE),
+                src.wrapping_add((n - 1 - i) * PAGE),
+            );
+            v.remap_shared_overwrite(to, from, PAGE).unwrap();
+        }
+        let limit = Limit::room(10);
+        assert!(!dies_at_the_budget(|| admit(20, "a test's view")));
+        drop(limit);
+        let first = at.addr().to_u64();
+        assert!(
+            files::mappings_between(first, first + n * PAGE) < 4,
+            "folded"
+        );
+        let limit = Limit::room(10);
+        assert!(
+            dies_at_the_budget(|| admit(20, "a test's view")),
+            "nothing left"
+        );
+        drop(limit);
+        assert!(v.deallocate(at, n * PAGE).is_success());
+        assert!(v.deallocate(src, n * PAGE).is_success());
+    }
+
+    /// A claim for what has another way stops the headroom short of the budget; one for what has
+    /// none reaches into the headroom, and neither past the budget
+    #[test]
+    fn only_what_has_no_other_way_claims_the_headroom() {
+        let _limit = Limit::room(HEADROOM + 10);
+        assert!(claim(11, Reach::ShortOfHeadroom).is_none());
+        assert!(claim(10, Reach::ShortOfHeadroom).is_some());
+        assert!(claim(HEADROOM + 10, Reach::Whole).is_some());
+        assert!(claim(HEADROOM + 11, Reach::Whole).is_none());
     }
 
     /// The budget is the limit less the reserve, and none where the limit does not read

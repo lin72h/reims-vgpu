@@ -679,20 +679,66 @@ before, and the vCPUs' time a frame falls 6-7% at the same frame rate.
 
 ### Linux hosts: `vm.max_map_count`
 
-On Linux the library's views of guest memory take a kernel mapping for each
-run of guest pages. An x86-64 guest's GPU memory comes in scattered 16 KiB
-pieces, so a view takes about 64 mappings per MiB. **Measured** with a 12 GiB
-x86-64 macOS 26.6.1 guest on an RTX 5080 Laptop GPU host (CachyOS, whose
-`vm.max_map_count` is 1,048,576): 2.2k to 3.3k guest-memory mappings at an
-idle desktop, 22k to 29k with Safari and Maps open, back to the idle count
-after they quit, and 1.7k to 4.6k other mappings in the process.
+On Linux the library's views of guest memory take kernel mappings, which
+count against `vm.max_map_count` (the kernel's default is 65,530; some
+distributions raise it). An x86-64 macOS guest hands out its pages
+in 16 KiB clumps laid backwards, and a mapping of a file runs only forwards,
+so a view mapped from the guest's files takes a mapping per 4 KiB page.
+Measured on an RTX 5080 Laptop GPU host (Linux 7.2.8, `vm.max_map_count`
+1,048,576) with a 16 GiB macOS 26.6.1 guest at 3840x2160 HiDPI on 2026-10-27:
+- 99.97% of the views' mappings were single 4 KiB pages;
+- within 190 s of a window drag, a resize and Safari scrolling, the views held
+  1.03 million mappings over about 4 GiB of guest pages, each page in about
+  one view. That passed the budget, and the process died.
 
-The views stop 16,384 mappings short of `vm.max_map_count`, and a view past
-that is refused. Past the limit itself the kernel refuses QEMU's and the
-GPU driver's maps too. A stock limit of 65,530 holds about 770 MiB of live
-views. When a guest's RAM is leased, the library warns if the RAM, in 16 KiB
-pieces, would not fit. `sysctl -w vm.max_map_count=1048576` covers a 12 GiB
-guest.
+So the library maps a view of scattered pages as dma-bufs of those pages,
+made with `/dev/udmabuf`: one mapping per 4 MiB at udmabuf's stock
+`list_limit` of 1,024 (`crates/reims-vgpu-vulkan/src/os/linux/vm.rs`, "Views
+through dma-bufs"). How the GPU then takes those pages depends on its driver:
+- **RADV** imports such a view through the dma-bufs, so the views stay small.
+- **NVIDIA's driver** (615) pins a pointer's pages, and refused both a pointer
+  into a udmabuf mapping and the dma-buf itself. A probe finds this as the
+  device is made. From then on, views are mapped from their files while they
+  fit 8,192 mappings short of the budget (`budget.rs`, `HEADROOM`), and
+  through dma-bufs past that. An import of a view's pages, which has no
+  other way, maps them from their files, into those 8,192 mappings too. Only
+  past the whole budget is it handed over as mapped, which the driver
+  refuses, and the runtime refuses the import as it refuses any import there;
+  with `REIMS_VGPU_STRICT=1` it ends the process. A buffer's import of
+  read-only pages needs a writable twin of them, which may take the whole
+  budget too. On such a host a raised limit lets more imports through.
+- **Before anything would die or be refused at the whole budget**, the
+  library folds back into dma-bufs the views' pages mapped from their files
+  that no live import a device may pin holds, and weighs again (`vm.rs`,
+  "Folding back"). Only where that frees too little does a view die or an
+  import get refused. A map the kernel itself refuses at `vm.max_map_count`,
+  when the rest of the process holds more than the 16,384 kept for it, folds
+  the same way and is tried once more; only a second refusal ends the
+  process.
+- **Where `/dev/udmabuf` is not the process's** (the device node is the `kvm`
+  group's on Ubuntu), every view is mapped from its files, and a view past the
+  budget ends the process, naming the numbers. At the kernel's default that
+  is about 192 MiB of an x86-64 guest's views, so such a host needs udmabuf,
+  not a higher limit.
+
+The budget is `vm.max_map_count` less 16,384 mappings kept for the rest of
+the process (QEMU, the C library, the driver, the runtime). On the same host,
+with a 12 GiB guest on 2026-10-10, the process held 1.7k to 4.6k mappings
+besides its views. The library's own count is exact at every map and unmap,
+and views and imports that choose between files and dma-bufs are weighed
+together as they are made, so threads making them at once cannot pass the
+line between them.
+
+What gets logged:
+- Where udmabuf is not the process's, a warning when the guest's RAM is
+  leased, if the RAM at a mapping per 4 KiB page would not fit.
+- On a device that needs pages mapped from their files, a warning if imports
+  of all of the guest's RAM, a mapping per 4 KiB page, would pass the budget,
+  with the `sysctl -w vm.max_map_count=...` value that covers them (2^23,
+  8,388,608, for a 16 GiB guest).
+- Each import handed over as mapped is counted with its bytes, logged at the
+  first and at each power of two, and written to the trace (`noroom`: first
+  byte, length, mappings it would have taken).
 
 ### Linux hosts: AMD GPUs and udmabuf
 

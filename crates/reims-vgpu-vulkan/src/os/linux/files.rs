@@ -26,6 +26,15 @@
 //! them, and splits a mapping where part of it is unmapped or protected apart, as the table cuts
 //! its runs, so the count follows every view, protect and unmap. Registrations map nothing.
 //!
+//! **Runs mapped through a dma-buf.** A view of many runs of file pages may be mapped as a few
+//! dma-bufs of those pages instead, one mapping each whatever the pages' order
+//! ([`super::vm`]'s module docs, "Views through dma-bufs"). Each of its runs still names the file
+//! and offset it shows, which is what a view of it or a dma-buf of its pages is made of, and also
+//! the dma-buf it is mapped through and its offset there ([`Through`]): two such neighbours are
+//! one mapping where they lie in the same dma-buf, the second at the offset the first ends at,
+//! with the same protection, whatever their files; a run mapped through a dma-buf and one mapped
+//! from its file never are.
+//!
 //! The table is a leaf lock: nothing is called under it.
 
 use std::collections::BTreeMap;
@@ -47,13 +56,31 @@ pub(crate) struct Backing {
     pub(crate) offset: u64,
 }
 
-/// A run of the library's own mapping: its end, its file and the protection set on it
-/// (`PROT_*`).
+/// A run of the library's own mapping: its end, its file, the protection set on it (`PROT_*`),
+/// and the dma-buf it is mapped through, if it is (module docs).
 #[derive(Clone, Debug)]
 struct Run {
     end: u64,
     backing: Backing,
     prot: i32,
+    through: Option<Through>,
+}
+
+/// Where a run mapped through a dma-buf lies in it: the dma-buf, by a number of the process's
+/// own (one per mapping of one, never used again), and the offset of the run's first byte there
+/// (module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Through {
+    pub(crate) buf: u64,
+    pub(crate) offset: u64,
+}
+
+impl Through {
+    /// A number for a mapping of a new dma-buf, unique in the process.
+    pub(crate) fn new_buf() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// A registration: `first..end` shows `backing`, read and write, `count` times registered.
@@ -92,13 +119,19 @@ static TABLE: Mutex<Table> = Mutex::new(Table {
 });
 
 /// Whether the kernel holds the run `a` from `a_first` and the run `b` from `b_first` as one
-/// mapping: `b` starts where `a` ends, in the same file at the offset `a` ends at, with the same
-/// protection (module docs).
+/// mapping: `b` starts where `a` ends, with the same protection, mapped from the same file at the
+/// offset `a` ends at, or through the same dma-buf at the offset `a` ends at there (module docs).
 fn joined(a_first: u64, a: &Run, b_first: u64, b: &Run) -> bool {
-    a.end == b_first
-        && Arc::ptr_eq(&a.backing.fd, &b.backing.fd)
-        && a.backing.offset + (a.end - a_first) == b.backing.offset
-        && a.prot == b.prot
+    let length = a.end - a_first;
+    let follows = match (a.through, b.through) {
+        (None, None) => {
+            Arc::ptr_eq(&a.backing.fd, &b.backing.fd)
+                && a.backing.offset + length == b.backing.offset
+        }
+        (Some(a), Some(b)) => a.buf == b.buf && a.offset + length == b.offset,
+        _ => false,
+    };
+    a.end == b_first && a.prot == b.prot && follows
 }
 
 impl Table {
@@ -177,6 +210,10 @@ impl Table {
                 offset: run.backing.offset + (at - first),
             },
             prot: run.prot,
+            through: run.through.map(|t| Through {
+                buf: t.buf,
+                offset: t.offset + (at - first),
+            }),
         };
         self.insert(first, Run { end: at, ..run });
         self.insert(at, tail);
@@ -194,11 +231,27 @@ impl Table {
         }
     }
 
-    /// `first..end` shows `backing` with protection `prot` from now on (`record`).
-    fn record(&mut self, first: u64, end: u64, backing: Backing, prot: i32) {
+    /// `first..end` shows `backing` with protection `prot` from now on, mapped through the
+    /// dma-buf `through` names where it does (`record`).
+    fn record(
+        &mut self,
+        first: u64,
+        end: u64,
+        backing: Backing,
+        prot: i32,
+        through: Option<Through>,
+    ) {
         self.forget(first, end);
         if first < end {
-            self.insert(first, Run { end, backing, prot });
+            self.insert(
+                first,
+                Run {
+                    end,
+                    backing,
+                    prot,
+                    through,
+                },
+            );
         }
     }
 
@@ -251,9 +304,9 @@ pub(crate) fn mappings() -> u64 {
     TABLE.lock().mappings().to_u64()
 }
 
-/// The kernel's mappings the table's runs in `first..end` take, as [`mappings`] counts them
-/// (tests: a range's count to set beside the kernel's).
-#[cfg(test)]
+/// The kernel's mappings the table's runs in `first..end` take, as [`mappings`] counts them:
+/// what a fold of them would free (`super::vm::fold_idle`), and in tests a range's count to set
+/// beside the kernel's.
 pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
     let table = TABLE.lock();
     let mut count = 0u64;
@@ -265,6 +318,24 @@ pub(crate) fn mappings_between(first: u64, end: u64) -> u64 {
         before = Some((at, run));
     }
     count
+}
+
+/// The spans of the table's runs mapped from their files, in order, each of such runs that follow
+/// one another in the address space with none through a dma-buf between: what a fold may map
+/// through dma-bufs instead (`super::vm::fold_idle`).
+pub(crate) fn file_spans() -> Vec<std::ops::Range<u64>> {
+    let table = TABLE.lock();
+    let mut spans: Vec<std::ops::Range<u64>> = Vec::new();
+    for (&at, run) in &table.runs {
+        if run.through.is_some() {
+            continue;
+        }
+        match spans.last_mut() {
+            Some(span) if span.end == at => span.end = run.end,
+            _ => spans.push(at..run.end),
+        }
+    }
+    spans
 }
 
 /// The runs the table holds in `first..end`, each a remap's piece or what a cut left of one
@@ -279,7 +350,7 @@ pub(crate) fn runs_between(first: u64, end: u64) -> usize {
 pub(crate) fn record(first: u64, length: u64, backing: Backing, prot: i32) {
     TABLE
         .lock()
-        .record(first, first.saturating_add(length), backing, prot);
+        .record(first, first.saturating_add(length), backing, prot, None);
 }
 
 /// `length` bytes from `first` show no file from now on.
@@ -328,8 +399,41 @@ pub(crate) fn record_pieces(target: u64, pieces: Vec<Piece>) {
     for piece in pieces {
         let first = target.saturating_add(piece.at);
         let end = first.saturating_add(piece.length);
-        table.record(first, end, piece.backing, piece.prot);
+        table.record(first, end, piece.backing, piece.prot, None);
     }
+}
+
+/// As [`record_pieces`], for pieces mapped through dma-bufs, each where its [`Through`] says
+/// (module docs).
+pub(crate) fn record_through(target: u64, pieces: Vec<(Piece, Through)>) {
+    let mut table = TABLE.lock();
+    for (piece, through) in pieces {
+        let first = target.saturating_add(piece.at);
+        let end = first.saturating_add(piece.length);
+        table.record(first, end, piece.backing, piece.prot, Some(through));
+    }
+}
+
+/// The runs in `first..end` mapped through a dma-buf, cut to it, in order, as pieces from
+/// `first`: what an import's unfold maps from their files (`super::vm::unfold`).
+pub(crate) fn through_pieces(first: u64, end: u64) -> Vec<Piece> {
+    let table = TABLE.lock();
+    let from = table.run_at(first).map_or(first, |(at, _)| at);
+    (table.runs.range(from..end))
+        .filter(|(_, run)| run.through.is_some() && run.end > first)
+        .map(|(&at, run)| {
+            let start = at.max(first);
+            Piece {
+                at: start - first,
+                length: run.end.min(end) - start,
+                backing: Backing {
+                    fd: Arc::clone(&run.backing.fd),
+                    offset: run.backing.offset + (start - at),
+                },
+                prot: run.prot,
+            }
+        })
+        .collect()
 }
 
 /// Sets the protection of what of the runs lies in `length` bytes from `first` to `prot`,
@@ -628,12 +732,12 @@ mod tests {
         };
         // Four pages of one file in order: one mapping.
         for i in 0..4 {
-            t.record(at(i), at(i + 1), b(&f, i * page), rw);
+            t.record(at(i), at(i + 1), b(&f, i * page), rw, None);
         }
         assert_eq!(t.mappings(), 1);
         // A page of the file out of order after them, then a page of another file: three.
-        t.record(at(4), at(5), b(&f, 0x9000), rw);
-        t.record(at(5), at(6), b(&g, 0xa000), rw);
+        t.record(at(4), at(5), b(&f, 0x9000), rw, None);
+        t.record(at(5), at(6), b(&g, 0xa000), rw, None);
         assert_eq!(t.mappings(), 3);
         // The second page read-only cuts the first mapping in three; read and write again, one.
         t.protect(at(1), at(2), libc::PROT_READ);
@@ -643,12 +747,65 @@ mod tests {
         // An unmap of the second page cuts it in two; the page mapped again as it was, one.
         t.forget(at(1), at(2));
         assert_eq!(t.mappings(), 4);
-        t.record(at(1), at(2), b(&f, page), rw);
+        t.record(at(1), at(2), b(&f, page), rw, None);
         assert_eq!(t.mappings(), 3);
         // Another page of the file over the third: the first mapping in three.
-        t.record(at(2), at(3), b(&f, 0x20_000), rw);
+        t.record(at(2), at(3), b(&f, 0x20_000), rw, None);
         assert_eq!(t.mappings(), 5);
         t.forget(base, at(6));
+        assert_eq!((t.mappings(), t.joins, t.runs.len()), (0, 0, 0));
+    }
+
+    /// Runs mapped through a dma-buf are one mapping where each lies in the same dma-buf at the
+    /// offset the one before ends at, whatever their files: a protect or an unmap cuts it as it
+    /// cuts a file's mapping, and a run of the dma-buf never joins one mapped from its file
+    #[test]
+    fn runs_through_a_dma_buf_count_as_its_mappings() {
+        let (f, g) = (file(), file());
+        let mut t = Table::default();
+        let page = 0x1000;
+        let at = |i: u64| 0x3000_0000 + i * page;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let b = |fd: &Arc<OwnedFd>, offset| Backing {
+            fd: Arc::clone(fd),
+            offset,
+        };
+        // Pages of two files backwards, through one dma-buf, then through a second: two mappings.
+        let (one, two) = (Through::new_buf(), Through::new_buf());
+        for i in 0..6 {
+            let fd = if i % 2 == 0 { &f } else { &g };
+            let (buf, offset) = if i < 4 {
+                (one, i * page)
+            } else {
+                (two, (i - 4) * page)
+            };
+            let through = Through { buf, offset };
+            t.record(at(i), at(i + 1), b(fd, (9 - i) * page), rw, Some(through));
+        }
+        assert_eq!(t.mappings(), 2);
+        // Its second page read-only: three more; read and write again, as before.
+        t.protect(at(1), at(2), libc::PROT_READ);
+        assert_eq!(t.mappings(), 4);
+        t.protect(at(1), at(2), rw);
+        assert_eq!(t.mappings(), 2);
+        // A cut keeps the count, and the tail lies further into the dma-buf.
+        t.cut(at(0) + page / 2);
+        assert_eq!(t.mappings(), 2);
+        let tail = t.run_at(at(0) + page / 2).unwrap().1.through.unwrap();
+        assert_eq!(
+            tail,
+            Through {
+                buf: one,
+                offset: page / 2
+            }
+        );
+        // The third page unmapped, then mapped from its file at the offset that follows the
+        // second's: apart from both, as the kernel holds a file's mapping and a dma-buf's.
+        t.forget(at(2), at(3));
+        assert_eq!(t.mappings(), 3);
+        t.record(at(2), at(3), b(&f, 7 * page), rw, None);
+        assert_eq!(t.mappings(), 4);
+        t.forget(at(0), at(6));
         assert_eq!((t.mappings(), t.joins, t.runs.len()), (0, 0, 0));
     }
 
@@ -664,7 +821,7 @@ mod tests {
             fd: Arc::clone(&f),
             offset: 0,
         };
-        t.record(at(0), at(4), backing, rw);
+        t.record(at(0), at(4), backing, rw, None);
         t.protect(at(1), at(3), rw);
         assert_eq!((t.runs.len(), t.mappings()), (1, 1), "unchanged");
         t.protect(at(1), at(2), libc::PROT_READ);

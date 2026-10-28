@@ -1473,17 +1473,22 @@ pub(crate) fn gather(
     }
     .unwrap_or_else(|kr| refused_by_host(sel, "address space for an alias", length, kr));
     let alias = Alias::own(NonNull::new(at.as_ptr::<u8>())?, length);
-    for run in runs {
-        let source = HostPtr::from_addr(usize::try_from(run.source).ok()?);
-        if let Err(kr) = vm.remap_shared_overwrite(at.wrapping_add(run.offset), source, run.length)
-        {
-            refused_by_host(
-                sel,
-                "a remap of the guest's pages into an alias",
-                run.length,
-                kr,
-            );
-        }
+    // The runs follow on from the alias's start ([`runs`]), so they are one view, made at once:
+    // on Linux through dma-bufs of the pages where the host makes them (`crate::os`'s VM).
+    let mut sources = Vec::with_capacity(runs.len());
+    for run in &runs {
+        sources.push((
+            HostPtr::from_addr(usize::try_from(run.source).ok()?),
+            run.length,
+        ));
+    }
+    if let Err((i, kr)) = vm.remap_runs_shared_overwrite(at, &sources) {
+        refused_by_host(
+            sel,
+            "a remap of the guest's pages into an alias",
+            runs[i].length,
+            kr,
+        );
     }
     if read_only {
         if zero_block {

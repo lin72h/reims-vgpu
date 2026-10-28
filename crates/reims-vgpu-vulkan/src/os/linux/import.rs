@@ -80,6 +80,7 @@ use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::num::{ToU64, ToUsize};
@@ -129,6 +130,237 @@ pub(super) fn of_zeros(pieces: &[files::Piece]) -> Vec<bool> {
 pub(crate) struct ImportView {
     at: NonNull<u8>,
     twin: Option<Twin>,
+    /// The record of its pages a device may pin, where it imports them as they are mapped.
+    pinned: Option<Pinned>,
+}
+
+/// The pages a device of the process may pin now: each live import's, of pages it takes as they
+/// are mapped from their files (a pointer's, NVIDIA's and i915's), by first byte and number, to
+/// their end, from before the import maps them from their files until the import is freed
+/// ([`Pinned`]). A fold of the views maps none of them through dma-bufs
+/// (`super::vm::fold_idle`): a device took them by their mappings.
+static PINNED: Mutex<BTreeMap<(u64, u64), u64>> = Mutex::new(BTreeMap::new());
+
+/// One import's pages in [`PINNED`], until it drops.
+#[derive(Debug)]
+pub(crate) struct Pinned((u64, u64));
+
+impl Pinned {
+    /// The pages of `first..end`, where a device of the process takes imported pages as they are
+    /// mapped from their files ([`imports_need_files`]); `None` where none does.
+    fn new(first: u64, end: u64) -> Option<Pinned> {
+        imports_need_files().then(|| Pinned::of(first, end))
+    }
+
+    /// The pages of `first..end`, whatever the devices.
+    pub(super) fn of(first: u64, end: u64) -> Pinned {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let key = (first, NEXT.fetch_add(1, Ordering::Relaxed));
+        PINNED.lock().insert(key, end);
+        Pinned(key)
+    }
+}
+
+impl Drop for Pinned {
+    fn drop(&mut self) {
+        PINNED.lock().remove(&self.0);
+    }
+}
+
+/// The pages devices may pin now ([`PINNED`]), in order, those that meet joined.
+pub(super) fn pinned() -> Vec<std::ops::Range<u64>> {
+    let mut ranges: Vec<std::ops::Range<u64>> = (PINNED.lock().iter())
+        .map(|(&(first, _), &end)| first..end)
+        .collect();
+    ranges.sort_by_key(|r| r.start);
+    let mut joined: Vec<std::ops::Range<u64>> = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        match joined.last_mut() {
+            Some(last) if range.start <= last.end => last.end = last.end.max(range.end),
+            _ => joined.push(range),
+        }
+    }
+    joined
+}
+
+/// Whether a device of the process imports by pointer only pages mapped from their files: learned
+/// of each device as it is made ([`learn_view_imports`]), and set where any refuses a view through
+/// dma-bufs. From then on views are mapped from their files (`super::vm`'s module docs, "Imports
+/// of views"), and an import of a view made through dma-bufs before maps its pages from their
+/// files ([`pages_from_files`]).
+static IMPORTS_NEED_FILES: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a device of the process imports by pointer only pages mapped from their files
+/// ([`learn_view_imports`]).
+pub(crate) fn imports_need_files() -> bool {
+    IMPORTS_NEED_FILES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether a view of several runs of pages made now is mapped through dma-bufs: udmabuf is the
+/// process's, and no device of it needs imported pages mapped from their files (`super::vm`'s
+/// module docs, "Views through dma-bufs").
+#[cfg(test)]
+pub(crate) fn views_through_dma_bufs() -> bool {
+    super::dma_buf::opens() && !imports_need_files()
+}
+
+/// Imports refused at the views' budget, of one kind: how many and their bytes, each written to
+/// the trace (its first byte, its length and the mappings it would have taken) and the count
+/// logged at the first and at each power of two.
+struct Refused {
+    /// The trace record's name.
+    record: &'static str,
+    /// The refusals so far.
+    count: AtomicU64,
+    /// Their bytes.
+    bytes: AtomicU64,
+}
+
+impl Refused {
+    const fn new(record: &'static str) -> Refused {
+        Refused {
+            record,
+            count: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+        }
+    }
+
+    /// Counts the refusal of `first..end`, which would have taken `adding` mappings: the count
+    /// and the bytes so far, where the count is one to log.
+    fn count(&self, first: u64, end: u64, adding: u64) -> Option<(u64, u64)> {
+        reims_vgpu_core::trace::event(self.record, &[first, end - first, adding]);
+        let bytes = self.bytes.fetch_add(end - first, Ordering::Relaxed) + (end - first);
+        let count = self.count.fetch_add(1, Ordering::Relaxed) + 1;
+        count.is_power_of_two().then_some((count, bytes))
+    }
+}
+
+/// The imports handed over as mapped ([`no_room_to_unfold`]).
+static HANDED_OVER: Refused = Refused::new("noroom");
+
+/// The import of `first..end`, whose pages lie in views through dma-bufs, where mapping them from
+/// their files would take their `adding` mappings past the views' whole budget, the headroom
+/// included, which an import, having no other way, may take (`super::budget`'s `claim`,
+/// `Reach::Whole`): they stay as they are, and the import is handed over as they are mapped,
+/// which a device that pins a pointer's pages refuses (NVIDIA's), as the runtime refuses any
+/// import there, and a lend fails as the host refuses it.
+/// The one place the views' budget refuses an import (`super::vm`'s module docs, "Imports of
+/// views"). Each is counted with its bytes ([`Refused`], trace record `noroom`); in strict mode
+/// (`REIMS_VGPU_STRICT=1`) it ends the process, as a view past the budget does
+/// (`super::budget`'s `admit`).
+pub(crate) fn no_room_to_unfold(first: u64, end: u64, adding: u64) {
+    if crate::answer::strict() {
+        budget::exhausted_whole(adding, "an import's view of guest pages");
+    }
+    if let Some((count, bytes)) = HANDED_OVER.count(first, end, adding) {
+        log::warn!(
+            target: "reims_vgpu_vulkan::os",
+            "{count} imports of {} KiB in all handed over as mapped through dma-bufs, which a \
+             device that pins their pages refuses: mapping their pages from their files would \
+             have taken the views of memory past their budget (vm.max_map_count), the latest's \
+             {adding} mappings for {:#x} bytes at {first:#x}; REIMS_VGPU_STRICT=1 makes each a \
+             death",
+            bytes >> 10,
+            end - first
+        );
+    }
+}
+
+/// The address of `at`.
+fn addr_of(at: NonNull<u8>) -> u64 {
+    at.as_ptr().addr().to_u64()
+}
+
+/// Maps what of the whole pages of `length` bytes at `at` lies in a view through dma-bufs from
+/// their files, which a device given their address pins as they are mapped (a mapping of a
+/// dma-buf it cannot pin), for as long as the view lives (`super::vm::unfold`), as far as the
+/// views' whole budget, as a lend has no other way; past it, [`no_room_to_unfold`]. The record of
+/// the pages the device may pin ([`Pinned`]), which the caller holds while the device may.
+pub(crate) fn pages_from_files(at: NonNull<u8>, length: u64) -> Pinned {
+    let page = vm::page_size();
+    let start = addr_of(at);
+    let end = start.saturating_add(length.max(1)).next_multiple_of(page);
+    let first = start - start % page;
+    let pinned = Pinned::of(first, end);
+    if let Err(adding) = vm::unfold(first, end, budget::Reach::Whole) {
+        no_room_to_unfold(first, end, adding);
+    }
+    pinned
+}
+
+/// Learns whether `device` imports a view mapped through dma-bufs as it is mapped, as the
+/// platform's imports hand the runtime a view ([`host_memory`]): a no-copy buffer over a view of
+/// pages backwards, one more than udmabuf takes in one dma-buf, so two, made as an import is,
+/// placed outside the guest's numbering and released at once. Where the device does not take it
+/// through the dma-bufs its source makes, views are mapped from their files from then on
+/// ([`IMPORTS_NEED_FILES`]): where it refuses it, and where it takes the view's pointer, as no
+/// driver pins a `VM_PFNMAP` mapping's pages and one that pins them at the GPU's first use of
+/// them, not at the import (as i915's userptr does without `I915_USERPTR_PROBE`, not measured
+/// here), would fail there. A device
+/// imports such a view by its dma-bufs where it imports none by pointer (RADV), and refuses it
+/// where it pins the pointer's pages and imports no foreign dma-buf (NVIDIA's 615 driver, measured
+/// 2026-10-27, `super::vm`'s module docs, "Imports of views"). Nothing is learned where the view is
+/// not mapped through dma-bufs (udmabuf not the process's): no import then needs it.
+pub(crate) fn learn_view_imports(device: &rt::Device) {
+    use reims_vgpu_core::platform::os::vm::HostVm as _;
+    if IMPORTS_NEED_FILES.load(Ordering::Relaxed) {
+        return;
+    }
+    let vm = super::LinuxVm::new();
+    let page = vm::page_size();
+    let count = super::dma_buf::limits()
+        .pieces
+        .saturating_add(1)
+        .min(1 << 16);
+    let length = count * page;
+    let (Ok(src), Ok(view)) = (vm::allocate_aliasable(length), vm.allocate_anywhere(length)) else {
+        return;
+    };
+    let runs: Vec<_> = (0..count)
+        .map(|i| (src.wrapping_add((count - 1 - i) * page), page))
+        .collect();
+    let first = view.addr().to_u64();
+    let through = vm.remap_runs_shared_overwrite(view, &runs).is_ok()
+        && !files::through_pieces(first, first + length).is_empty();
+    if through && let Some(at) = address(first) {
+        let asked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // SAFETY: the view is mapped, read and write, and stays so until after the buffer, which
+        // has no deallocator or keep-alive, is released: its import is freed in the release.
+        let memory = unsafe { host_memory_noting(at, false, Some(Arc::clone(&asked))) };
+        let contents = rt::BufferContents::NoCopy {
+            memory,
+            deallocator: None,
+            keep_alive: None,
+        };
+        let descriptor = rt::BufferDescriptor::new(length, rt::ResourceOptions::shared(), contents)
+            .with_placement(rt::AddressPlacement::Outside);
+        let refused = device.new_buffer_with_descriptor(descriptor).is_err();
+        let through_dma_bufs = !refused && asked.load(Ordering::Relaxed);
+        let why = dma_buf_refusal();
+        log::info!(
+            target: "reims_vgpu_vulkan::os",
+            "{}: an import of a view of guest pages mapped through dma-bufs {}",
+            device.properties().name,
+            match (refused, through_dma_bufs) {
+                (true, _) => "is refused, so views are mapped from their files",
+                (false, false) => {
+                    "is taken by its pointer, which a driver pinning the pages at the GPU's first \
+                     use of them would fail then, so views are mapped from their files"
+                }
+                (false, true) => "is taken through its dma-bufs",
+            }
+        );
+        if let Some(why) = why {
+            log::debug!(target: "reims_vgpu_vulkan::os", "the view's dma-buf source: {why}");
+        }
+        if !through_dma_bufs {
+            IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
+            budget::warn_if_imports_short();
+        }
+    }
+    let _ = vm.deallocate(view, length);
+    let _ = vm.deallocate(src, length);
 }
 
 // SAFETY: `at` is an address only, which nothing here reads through: it is handed to the runtime;
@@ -172,14 +404,16 @@ impl ImportView {
     /// The runtime's deallocator of the import, and what keeps the import's memory mapped beside
     /// the bytes themselves. With a twin: `inner`, given `original`, the address the bytes were
     /// given at, and the twin, which the runtime drops once it freed the import, so the twin is
-    /// unmapped after it. Without one, `inner` as it is, and nothing.
+    /// unmapped after it. Without one, `inner` as it is, and the record of the pages a device may
+    /// pin ([`Pinned`]), where there is one.
     pub(crate) fn release(
         self,
         original: NonNull<u8>,
         inner: Option<rt::Deallocator>,
     ) -> (Option<rt::Deallocator>, Option<rt::KeepAlive>) {
         let Some(twin) = self.twin else {
-            return (inner, None);
+            let pinned = self.pinned.map(|p| -> rt::KeepAlive { Box::new(p) });
+            return (inner, pinned);
         };
         let original = SendPtr(original);
         let inner = inner.map(|inner| -> rt::Deallocator {
@@ -211,11 +445,28 @@ impl ImportView {
 ///
 /// `rt::HostMemory::new`'s contract, for the memory at `at`.
 pub(crate) unsafe fn host_memory(at: NonNull<u8>, logged: bool) -> rt::HostMemory {
+    // SAFETY: the caller's.
+    unsafe { host_memory_noting(at, logged, None) }
+}
+
+/// [`host_memory`], setting `asked` where the runtime asks its source for dma-bufs.
+///
+/// # Safety
+///
+/// [`host_memory`]'s.
+unsafe fn host_memory_noting(
+    at: NonNull<u8>,
+    logged: bool,
+    asked: Option<Arc<std::sync::atomic::AtomicBool>>,
+) -> rt::HostMemory {
     // An earlier import's refusal is not this one's.
     REFUSAL.with_borrow_mut(|kept| *kept = None);
     // The import's files of zeros, which every request of its source over the same pages takes.
     let zeros = super::dma_buf::Zeros::default();
     let source: rt::DmaBufSource = Arc::new(move |request: rt::DmaBufRequest| {
+        if let Some(asked) = &asked {
+            asked.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
         let first = shown_at(request.start).as_ptr().addr().to_u64();
         let (length, granule) = (request.length, request.granule);
         match super::dma_buf::of_pages(first, length, granule, &zeros) {
@@ -272,9 +523,16 @@ impl SendPtr {
 /// The memory the runtime imports for `length` bytes at `at`: those bytes where every page of
 /// them is mapped writable or one has no file behind it (which the runtime then refuses as it
 /// refuses any import there), and otherwise a writable twin of their pages, at the same offset in
-/// its first page (module docs).
+/// its first page (module docs). Where a device needs imported pages mapped from their files, what
+/// of the bytes lies in views through dma-bufs is mapped from them, as far as the whole budget of
+/// views, since an import has no other way; past it the import is handed over as mapped
+/// ([`no_room_to_unfold`]).
 pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
-    let plain = ImportView { at, twin: None };
+    let plain = ImportView {
+        at,
+        twin: None,
+        pinned: None,
+    };
     let start = at.as_ptr().addr().to_u64();
     let page = vm::page_size();
     let first = start & !(page - 1);
@@ -286,12 +544,19 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
     };
     // Looked up without collecting the pieces, which only a twin needs.
     if files::writable(first, end - first) != Some(false) {
-        return plain;
+        // Recorded before its pages are mapped from their files, so no fold maps them back.
+        let pinned = Pinned::new(first, end);
+        if imports_need_files()
+            && let Err(adding) = vm::unfold(first, end, budget::Reach::Whole)
+        {
+            no_room_to_unfold(first, end, adding);
+        }
+        return ImportView { pinned, ..plain };
     }
     let Some(pieces) = files::pieces(first, end - first) else {
         return plain;
     };
-    let Some(twin) = twin(first, end - first, &pieces) else {
+    let Some(twin) = vm::reclaiming(|| twin(first, end - first, &pieces)) else {
         return plain;
     };
     log::debug!(
@@ -305,6 +570,7 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
     ImportView {
         at: twin_at,
         twin: Some(twin),
+        pinned: None,
     }
 }
 
@@ -573,5 +839,124 @@ mod tests {
         let p = NonNull::new(at.as_ptr::<u8>()).unwrap();
         assert_eq!(import_view(p, PAGE).at(), p);
         assert!(vm.deallocate(at, PAGE).is_success());
+    }
+
+    /// Where a device of the process needs imported pages mapped from their files, a view that
+    /// from its files would come within the headroom of the views' budget is mapped through a
+    /// dma-buf, though the budget has room for it. An import of it, which has no other way, maps
+    /// the pages from their files into the headroom; past the whole budget it is handed over as it
+    /// is mapped by default, counted with its bytes, and ends the process in strict mode. Where
+    /// udmabuf does not open, the view is mapped from its files, and ends the process past the
+    /// budget. The flag is the process's, which nextest runs this test alone in.
+    #[test]
+    fn past_the_budget_imports_are_handed_over_as_mapped() {
+        use reims_vgpu_core::raise::death::DeathKind;
+        use reims_vgpu_core::testkit::capture::catch_death;
+        fn dies<R>(f: impl FnOnce() -> R) -> bool {
+            catch_death(f).is_err_and(|site| (site.kind, site.file) == (DeathKind::Abort, "mmap"))
+        }
+        let counted = |r: &Refused| {
+            (
+                r.count.load(Ordering::Relaxed),
+                r.bytes.load(Ordering::Relaxed),
+            )
+        };
+        IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
+        let vm = LinuxVm::new();
+        let n = 32u64;
+        let src = vm::allocate_aliasable(n * PAGE).unwrap();
+        let view = vm.allocate_anywhere(n * PAGE).unwrap();
+        let runs: Vec<_> = (0..n)
+            .map(|i| (src.wrapping_add((n - 1 - i) * PAGE), PAGE))
+            .collect();
+        let through = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/udmabuf")
+            .is_ok();
+        // Room in the budget for the view from its files, none short of it by the headroom.
+        let limit = |room| budget::held() + budget::RESERVE + room;
+        if through {
+            budget::set_test_limit(Some(limit(budget::HEADROOM + 8)));
+            vm.remap_runs_shared_overwrite(view, &runs).unwrap();
+            let p = NonNull::new(view.as_ptr::<u8>()).unwrap();
+            let (first, end) = (addr(p), addr(p) + n * PAGE);
+            let mappings = || vm::tests::kernel_mappings(first, end);
+            assert_eq!(mappings(), 1, "the view, through a dma-buf");
+            // No room past the budget's headroom either.
+            budget::set_test_limit(Some(limit(8)));
+            assert!(dies(|| import_view(p, n * PAGE)), "strict");
+            let (handed, handed_bytes) = counted(&HANDED_OVER);
+            let import = crate::answer::relaxed(|| import_view(p, n * PAGE));
+            assert_eq!(
+                (import.at(), mappings()),
+                (p, 1),
+                "handed over as mapped"
+            );
+            assert_eq!(counted(&HANDED_OVER), (handed + 1, handed_bytes + n * PAGE));
+            budget::set_test_limit(Some(limit(budget::HEADROOM + 8)));
+            let import = import_view(p, n * PAGE);
+            assert_eq!(
+                (import.at(), mappings()),
+                (p, n),
+                "from their files in the headroom"
+            );
+        } else {
+            budget::set_test_limit(Some(limit(n)));
+            assert!(dies(|| vm.remap_runs_shared_overwrite(view, &runs)));
+        }
+        budget::set_test_limit(None);
+        assert!(vm.deallocate(view, n * PAGE).is_success());
+        assert!(vm.deallocate(src, n * PAGE).is_success());
+    }
+
+    /// Where a device of the process imports by pointer only pages mapped from their files, an
+    /// import of a view mapped through a dma-buf maps its pages from their files, the bytes as
+    /// they were, and they stay so once it goes; a second import of them maps nothing more, and a
+    /// view made from then on is mapped from its files. Where udmabuf does not open, every view
+    /// is mapped from its files. The flag is the process's, which nextest runs this test alone in.
+    #[test]
+    fn an_import_maps_its_pages_from_their_files() {
+        let vm = LinuxVm::new();
+        let n = 32u64;
+        let src = vm::allocate_aliasable(n * PAGE).unwrap();
+        let backwards = |view: HostAddr| {
+            let runs: Vec<_> = (0..n)
+                .map(|i| (src.wrapping_add((n - 1 - i) * PAGE), PAGE))
+                .collect();
+            vm.remap_runs_shared_overwrite(view, &runs).unwrap();
+            let first = addr(NonNull::new(view.as_ptr::<u8>()).unwrap());
+            (first, first + n * PAGE)
+        };
+        let view = vm.allocate_anywhere(n * PAGE).unwrap();
+        let (first, end) = backwards(view);
+        let through = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/udmabuf")
+            .is_ok();
+        let mappings = |first, end| vm::tests::kernel_mappings(first, end);
+        assert_eq!(
+            mappings(first, end),
+            if through { 1 } else { n },
+            "the view"
+        );
+        write(first + 7, 0x77);
+        IMPORTS_NEED_FILES.store(true, std::sync::atomic::Ordering::Relaxed);
+        let p = NonNull::new(view.as_ptr::<u8>()).unwrap();
+        let whole = import_view(p, n * PAGE);
+        assert_eq!((whole.at(), mappings(first, end)), (p, n), "imported");
+        assert_eq!(read(first + 7), 0x77);
+        drop(whole);
+        let again = import_view(address(first + 4 * PAGE).unwrap(), 2 * PAGE);
+        drop(again);
+        assert_eq!(mappings(first, end), n, "no import");
+        assert_eq!(read(first + 7), 0x77);
+        let other = vm.allocate_anywhere(n * PAGE).unwrap();
+        let (o_first, o_end) = backwards(other);
+        assert_eq!(mappings(o_first, o_end), n, "a view made since");
+        assert!(vm.deallocate(other, n * PAGE).is_success());
+        assert!(vm.deallocate(view, n * PAGE).is_success());
+        assert!(vm.deallocate(src, n * PAGE).is_success());
     }
 }

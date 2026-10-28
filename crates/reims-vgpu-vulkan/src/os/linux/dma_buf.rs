@@ -104,6 +104,9 @@ pub(crate) enum Refusal {
     /// The kernel refused the call otherwise (a file it takes no pages of, unsealed or not a
     /// memfd, or no memory to pin the pages).
     Kernel(io::Error),
+    /// A view would write through a dma-buf of a file the process holds open read-only, whose
+    /// pages the kernel maps writable from the file for no one ([`of_view`]).
+    ReadOnlyFile,
 }
 
 impl fmt::Display for Refusal {
@@ -133,6 +136,7 @@ impl fmt::Display for Refusal {
                 )
             }
             Refusal::Kernel(e) => write!(f, "UDMABUF_CREATE_LIST failed: {e}"),
+            Refusal::ReadOnlyFile => write!(f, "a writable view of a file open read-only"),
         }
     }
 }
@@ -145,7 +149,7 @@ pub(crate) struct Limits {
 }
 
 /// udmabuf's limits as the host has them now, its defaults where it shows none.
-fn limits() -> Limits {
+pub(super) fn limits() -> Limits {
     let parameter = |name: &str, default: u64| {
         let path = format!("/sys/module/udmabuf/parameters/{name}");
         (std::fs::read_to_string(path).ok())
@@ -171,6 +175,11 @@ fn device() -> Result<&'static OwnedFd, Refusal> {
         Ok(unsafe { OwnedFd::from_raw_fd(raw) })
     });
     opened.as_ref().map_err(|e| Refusal::Device(Arc::clone(e)))
+}
+
+/// Whether `/dev/udmabuf` is the process's to open ([`device`]).
+pub(super) fn opens() -> bool {
+    device().is_ok()
 }
 
 /// A run of file pages: `length` bytes of `file` from `offset`.
@@ -394,6 +403,78 @@ pub(crate) fn of_pages(
         })
     });
     made.collect()
+}
+
+/// One dma-buf of a view's pages ([`of_view`]): `length` bytes of the view from `at`, to map with
+/// protection `prot`.
+#[derive(Debug)]
+pub(crate) struct ViewBuf {
+    pub(crate) fd: OwnedFd,
+    pub(crate) at: u64,
+    pub(crate) length: u64,
+    pub(crate) prot: i32,
+}
+
+/// Dma-bufs of the pages `pieces` show, in order, which mapped one after another are those pages
+/// (`super::vm`'s module docs, "Views through dma-bufs"): each piece's file pages, cut into
+/// chunks within udmabuf's limits and where the protection changes, the fewest that fit. Refused
+/// where `/dev/udmabuf` would not open or the kernel refuses a piece's file (one not a memfd, or
+/// not sealed against shrinking), with nothing made; and where a writable piece's file is open
+/// read-only, which udmabuf does not ask, as a map of the file shared and writable is refused
+/// (`EACCES`), so the view is no way past that.
+pub(crate) fn of_view(pieces: &[files::Piece]) -> Result<Vec<ViewBuf>, Refusal> {
+    let device = device()?;
+    let mut writable: Vec<&Arc<OwnedFd>> = Vec::new();
+    for piece in pieces.iter().filter(|p| p.prot & libc::PROT_WRITE != 0) {
+        let fd = &piece.backing.fd;
+        if writable.iter().any(|w| Arc::ptr_eq(w, fd)) {
+            continue;
+        }
+        // SAFETY: a query of an open descriptor's flags.
+        let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 || flags & libc::O_ACCMODE != libc::O_RDWR {
+            return Err(Refusal::ReadOnlyFile);
+        }
+        writable.push(fd);
+    }
+    let limits = limits();
+    let page = vm::page_size();
+    let mut made = Vec::new();
+    let mut from = 0;
+    while from < pieces.len() {
+        // The pieces from `from` of one protection.
+        let prot = pieces[from].prot;
+        let to = (from..pieces.len())
+            .find(|&i| pieces[i].prot != prot)
+            .unwrap_or(pieces.len());
+        let runs: Vec<Run<Arc<OwnedFd>>> = pieces[from..to]
+            .iter()
+            .map(|p| Run {
+                file: Arc::clone(&p.backing.fd),
+                offset: p.backing.offset,
+                length: p.length,
+            })
+            .collect();
+        let mut at = pieces[from].at;
+        let cut = chunks(&runs, page, limits).ok_or(Refusal::Limit {
+            pieces: runs.len() as u64,
+            bytes: runs.iter().map(|r| r.length).sum(),
+            granule: page,
+            limits,
+        })?;
+        for chunk in cut {
+            let length = chunk.iter().map(|r| r.length).sum();
+            made.push(ViewBuf {
+                fd: create(device, &chunk)?,
+                at,
+                length,
+                prot,
+            });
+            at += length;
+        }
+        from = to;
+    }
+    Ok(made)
 }
 
 /// One dma-buf of `runs`, in order (`UDMABUF_CREATE_LIST`).

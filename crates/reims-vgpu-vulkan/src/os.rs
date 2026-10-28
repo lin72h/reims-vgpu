@@ -32,9 +32,17 @@ use std::sync::Arc;
 /// per-import answers the runtime asks (`os/linux/dirty.rs`).
 #[cfg(target_os = "linux")]
 pub use host_os::dirty;
+/// Learns whether a device imports views of guest pages mapped through dma-bufs, on Linux
+/// (`os/linux/import.rs`).
+#[cfg(target_os = "linux")]
+pub(crate) use host_os::learn_view_imports;
 /// The loader the runtime opens, for `crate::host_gpus`'s own instances.
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::open_loader;
+/// Whether a view of several runs of pages made now is mapped through dma-bufs, on Linux
+/// (`os/linux/import.rs`).
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use host_os::views_through_dma_bufs;
 /// A surface's memory lent to a device outside the runtime, on Linux (`os/linux/device_lend.rs`),
 /// and what a host attaches to a surface for as long as it lives.
 #[cfg(target_os = "linux")]

@@ -517,23 +517,24 @@ fn view(runs: &[std::ops::Range<u64>], length: u64, zeros: u64, read_only: bool)
         let _ = vm.deallocate(at, whole);
         None
     };
+    // The runs as far as the allocation's length reaches, viewed at once (`LinuxVm`'s
+    // `remap_runs_shared_overwrite`: through dma-bufs of the pages where the host makes them).
     let mut offset = 0u64;
+    let mut sources = Vec::with_capacity(runs.len());
     for run in runs {
         if offset >= length {
             break;
         }
         let now = (run.end - run.start).min(length - offset);
-        let source = HostPtr::from_addr(run.start.to_usize());
-        if vm
-            .remap_shared_overwrite(at.wrapping_add(offset), source, now)
-            .is_err()
-        {
-            return refused(&format!(
-                "no view of {now:#x} bytes at {:#x}, which the library has no file of",
-                run.start
-            ));
-        }
+        sources.push((HostPtr::from_addr(run.start.to_usize()), now));
         offset += now;
+    }
+    if let Err((i, _)) = vm.remap_runs_shared_overwrite(at, &sources) {
+        let (source, now) = sources[i];
+        return refused(&format!(
+            "no view of {now:#x} bytes at {:#x}, which the library has no file of",
+            source.addr()
+        ));
     }
     if read_only {
         if let Err(z) = crate::gpu::backing::map_zeros(&vm, at, length, whole) {

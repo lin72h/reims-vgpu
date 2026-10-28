@@ -313,9 +313,12 @@ impl Drop for UnmapHold {
     }
 }
 
-/// Whether an unmap of a page of the `length` bytes at `at` waits for a hold, for tests.
+/// Whether an unmap of a page of the `length` bytes at `at` waits for a hold, for tests: read in
+/// [`OVERWRITES`]' order, so a hold whose release has begun has unmapped what waited for it
+/// before this answers `false` (its drop takes the unmaps out of [`HOLDS`], then makes them).
 #[cfg(test)]
 pub(crate) fn unmap_waits(at: HostPtr, length: u64) -> bool {
+    let _order = OVERWRITES.lock();
     let (at, length) = pages(at, length, OsVm::new().page_size());
     let first = at.addr().to_u64();
     HOLDS.lock().waits(&(first..first.saturating_add(length)))
@@ -419,6 +422,43 @@ impl HostVm for VulkanVm {
             (GUEST_MAPPINGS.lock()).mapped(first, first + pages.1, source.addr().to_u64());
         }
         Ok(at)
+    }
+
+    /// The OS's view of the runs at once, reported as their remaps one at a time are: the pages
+    /// of the runs it mapped, the runs before a refusal's, taken out of the waiting unmaps in
+    /// [`OVERWRITES`]' order and then reported changed.
+    fn remap_runs_shared_overwrite(
+        &self,
+        dst: HostAddr,
+        runs: &[(HostAddr, u64)],
+    ) -> Result<(), (usize, KernReturn)> {
+        let page = self.page_size();
+        let order = OVERWRITES.lock();
+        let made = self.vm.remap_runs_shared_overwrite(dst, runs);
+        let done = match made {
+            Ok(()) => runs.len(),
+            Err((failed, _)) => failed,
+        };
+        let mapped = (runs[..done].iter()).fold(0u64, |sum, &(_, len)| {
+            sum.saturating_add(len.saturating_add(page - 1) & !(page - 1))
+        });
+        let pages = length_pages(dst, mapped, page);
+        let first = pages.0.addr().to_u64();
+        HOLDS
+            .lock()
+            .replaced(&(first..first.saturating_add(pages.1)));
+        drop(order);
+        self.changed(pages);
+        #[cfg(test)]
+        {
+            let mut at = first;
+            for &(src, len) in &runs[..done] {
+                let (source, length) = length_pages(src, len, page);
+                (GUEST_MAPPINGS.lock()).mapped(at, at + length, source.addr().to_u64());
+                at += length;
+            }
+        }
+        made
     }
 
     fn protect_max(&self, addr: HostAddr, len: u64, prot: VmProt) -> Result<(), KernReturn> {
