@@ -6,6 +6,7 @@
 use std::sync::{Arc, Weak};
 
 use metal2vulkan_runtime as rt;
+use reims_vgpu_core::memory::dirty::{host_write, host_wrote};
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::os::surface::Surface;
 
@@ -318,6 +319,7 @@ pub(crate) fn write_surface_bytes(surface: &OsSurface, offset: u64, bytes: &[u8]
                 now.len(),
             );
         }
+        host_wrote(run.start, run.end - run.start);
         from = rest;
     }
     true
@@ -392,6 +394,8 @@ pub fn lend_surface_bytes(
                 length.to_usize(),
             )
         };
+        // The dirty log's bracket of the guest's pages `write` writes (`memory::dirty`).
+        let _written = host_write(first, length);
         write(bytes);
         return Ok(());
     }
@@ -421,6 +425,7 @@ pub fn lend_surface_bytes(
                 len,
             );
         }
+        host_wrote(run.start, run.end - run.start);
         at += len;
     }
     Ok(())

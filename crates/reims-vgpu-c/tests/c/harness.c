@@ -160,6 +160,16 @@ static RvgHostCallbacks host_callbacks(void) {
     return cb;
 }
 
+// A dirty source without a KVM VM (kvm_vm_fd -1), which the device takes as none, so its
+// for_each_slot never runs; it reports a slot through rvg_dirty_slot as a host's does.
+static bool on_for_each_slot(void *ctx, void *slot_ctx) {
+    (void)ctx;
+    rvg_dirty_slot(slot_ctx, 0, 0, 0x1000, 0);
+    return true;
+}
+
+static RvgDirtySource dirty_source;
+
 static RvgDeviceConfig device_config(const RvgHostCallbacks *cb) {
     RvgDeviceConfig c;
     memset(&c, 0, sizeof c);
@@ -167,6 +177,11 @@ static RvgDeviceConfig device_config(const RvgHostCallbacks *cb) {
     c.display_port_count = 2;
     c.memory_map = &ram_map;
     c.callbacks = cb;
+    memset(&dirty_source, 0, sizeof dirty_source);
+    dirty_source.struct_size = sizeof dirty_source;
+    dirty_source.kvm_vm_fd = -1;
+    dirty_source.for_each_slot = on_for_each_slot;
+    c.dirty_source = &dirty_source;
     return c;
 }
 

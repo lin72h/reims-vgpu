@@ -201,10 +201,16 @@ impl ImportView {
 /// the runtime then refuses the import as it would have, or makes the texture as it does where
 /// it cannot alias the memory.
 ///
+/// Where `logged` and the import's first byte lies in the guest's RAM of a device with a dirty
+/// source, the memory also carries the answers of which of its pages changed
+/// (`super::dirty::ImportDirty`), a twin's those of the memory it twins. `logged` is false for
+/// bytes the log never watches (`HostRange::unlogged`): the runtime copies them whole and never
+/// asks for a harvest.
+///
 /// # Safety
 ///
 /// `rt::HostMemory::new`'s contract, for the memory at `at`.
-pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
+pub(crate) unsafe fn host_memory(at: NonNull<u8>, logged: bool) -> rt::HostMemory {
     // An earlier import's refusal is not this one's.
     REFUSAL.with_borrow_mut(|kept| *kept = None);
     // The import's files of zeros, which every request of its source over the same pages takes.
@@ -229,7 +235,14 @@ pub(crate) unsafe fn host_memory(at: NonNull<u8>) -> rt::HostMemory {
         }
     });
     // SAFETY: the caller's.
-    unsafe { rt::HostMemory::with_dma_buf(at, source) }
+    let memory = unsafe { rt::HostMemory::with_dma_buf(at, source) };
+    let dirty = logged
+        .then(|| super::dirty::ImportDirty::new(shown_at(at).as_ptr().addr().to_u64()))
+        .flatten();
+    match dirty {
+        Some(dirty) => memory.with_dirty_pages(Arc::new(dirty)),
+        None => memory,
+    }
 }
 
 thread_local! {

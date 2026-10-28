@@ -443,6 +443,58 @@ typedef struct {
   uint64_t offset;
 } RvgMemoryRangeFile;
 
+// `start(ctx)`: start logging the guest's RAM's dirty pages, with KVM's manual dirty-log
+// protection and every page logged as written at its start (KVM_DIRTY_LOG_INITIALLY_SET).
+// Called once, at the first harvest. It must not block: the log may start later, and until it
+// does `for_each_slot` lists none of the RAM's slots. Without it, the log is taken as started.
+typedef void (*RvgDirtyStartFn)(void *ctx);
+
+// `flush_vcpus(ctx, timeout_ns)`: wait until each vCPU that was inside KVM_RUN has returned from
+// it once, so that KVM has drained the CPU's buffer of the vCPU's writes (Intel's
+// page-modification log) into the slots' logs, `timeout_ns` at most; false at the timeout.
+// Called only where `pml` of kvm_intel or kvm_amd is on. Without it, every harvest there takes
+// every watched page as written.
+typedef bool (*RvgDirtyFlushVcpusFn)(void *ctx, uint64_t timeout_ns);
+
+// `for_each_slot(ctx, slot_ctx)`: calls `rvg_dirty_slot(slot_ctx, ...)` for each memory slot of
+// the VM that logs dirty pages, holding the host's lock on its slots, so none changes before it
+// returns; false, calling none, where the host reads and clears the log itself (QEMU's global
+// dirty tracking).
+typedef bool (*RvgDirtyForEachSlotFn)(void *ctx, void *slot_ctx);
+
+// `take_host_writes(ctx, host_offset, length, words)`: ORs into `words`, one bit a 4 KiB page
+// from `host_offset`, the pages of `length` bytes the host itself wrote since its last take (its
+// DMA into the guest's RAM), and clears them in its record, not in KVM's log. Called only inside
+// `for_each_slot`'s `slot`, with `host_offset` and `length` multiples of 256 KiB. Without it,
+// the host writes none of the guest's RAM.
+typedef void (*RvgDirtyTakeHostWritesFn)(void *ctx,
+                                         uint64_t host_offset,
+                                         uint64_t length,
+                                         uint64_t *words);
+
+// The host's dirty source (RvgDeviceConfig.dirty_source): QEMU under KVM on Linux, which tells
+// the device which of the guest's pages the guest wrote, so that the library's Vulkan runtime
+// copies again, into a discrete GPU's memory or an iGPU's that cannot reference the guest's,
+// only those. The device reads KVM's dirty log itself, on its thread `reims-vgpu.dirty`, from
+// its first harvest on, which calls the functions below, one at a time; none may wait for the
+// library, or take a lock the host holds while it calls the library (QEMU's BQL). Nothing else
+// may clear the log of the guest's RAM while the device lives (QEMU's migration blocker). A
+// source with `kvm_vm_fd` below 0, or without `for_each_slot`, is none. `destroy` runs once,
+// after its last call: at the device's end, or before the create returns where the device takes
+// none (no memory map, or a refusal).
+typedef struct {
+  // sizeof(RvgDirtySource) as the host was compiled.
+  uint32_t struct_size;
+  // The KVM VM's file descriptor, open while the device lives.
+  int32_t kvm_vm_fd;
+  void *ctx;
+  RvgDestroyFn destroy;
+  RvgDirtyStartFn start;
+  RvgDirtyFlushVcpusFn flush_vcpus;
+  RvgDirtyForEachSlotFn for_each_slot;
+  RvgDirtyTakeHostWritesFn take_host_writes;
+} RvgDirtySource;
+
 // The device's config.
 typedef struct {
   // sizeof(RvgDeviceConfig) as the host was compiled.
@@ -492,6 +544,8 @@ typedef struct {
   // argument-buffer answer follows the same rule, read when the guest asks, since only
   // isolated tasks serve argument buffers. Without `process_isolation` it changes nothing.
   bool process_isolation_follows_guest;
+  // With `memory_map`: the host's dirty source, or NULL for none.
+  const RvgDirtySource *dirty_source;
 } RvgDeviceConfig;
 
 // Bytes the library allocated; free them with rvg_bytes_free.
@@ -900,6 +954,22 @@ const char *rvg_status_message(RvgStatus status);
 // `handler` is NULL or a function the host keeps callable, with `ctx`, from any thread for
 // the rest of the process.
 void rvg_log_set_handler(RvgLogFn handler, void *ctx, RvgLogLevel max_level);
+
+// One memory slot of the host's KVM VM that logs dirty pages, which a dirty source's
+// `for_each_slot` reports with the `slot_ctx` it was given, inside that call
+// (RvgDirtyForEachSlotFn). `slot` is as KVM_GET_DIRTY_LOG and KVM_CLEAR_DIRTY_LOG take it, the
+// address space's ID << 16 | the slot's ID; `length` is a multiple of 4 KiB; `host_offset` is
+// where its first page lies in the host's own record of its writes (RvgDirtyTakeHostWritesFn):
+// QEMU's ram_addr_t. Called anywhere else, it is undefined behaviour.
+//
+// # Safety
+//
+// `slot_ctx` is the one `for_each_slot` was given, and the call is inside that call.
+void rvg_dirty_slot(void *slot_ctx,
+                    uint32_t slot,
+                    uint64_t guest_physical_address,
+                    uint64_t length,
+                    uint64_t host_offset);
 
 // A new device. Refusals, checked in this order: RVG_ERR_INVALID_ARGUMENT for the config
 // itself (the files behind its memory map's ranges among it), RVG_ERR_UNSUPPORTED,

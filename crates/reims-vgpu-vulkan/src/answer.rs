@@ -111,8 +111,8 @@
 //! - Metal's own answer there is not one value: undefined, memory-dependent or racing;
 //! - no value the guest or the host sees;
 //! - the difference dies where it shows, at a later call;
-//! - pending a decision: `dont-care-load-tiles`, `extended-range-bits-kept` and
-//!   `unreached-tiles-rewritten`, and `heap-texture-lossless-layout` ([`HEARD`]).
+//! - pending a decision: `dont-care-load-tiles` and `extended-range-bits-kept`, and
+//!   `heap-texture-lossless-layout` ([`HEARD`]).
 //!
 //! That a guest's boot or a suite case reaches a kind is no reason: a kind none of these covers
 //! dies ([`DIES`]) until the runtime makes it exact or it is measured equal. The other heap
@@ -2403,34 +2403,26 @@ mod tests {
         //   mode, and a buffer's made after encoders whose take of Metal's range the runtime does
         //   not model, relayed as [`Inexact::IcbIdentifierAfterEncoder`].
         // Among the others:
-        // - `UnreachedTilesRewritten`, `DontCareLoadTiles` and `ExtendedRangeBitsKept`: the bytes
-        //   a pass leaves where its draws write nothing, announced at a pass Metal runs. Metal's
-        //   `DontCare` load zeroes every tile in a pass
-        //   of one layer with a draw call that clears and stores an attachment, none in a pass
-        //   whose draws draw nothing and that clears and stores none, and else the tiles a
-        //   draw's primitive reaches within that draw's viewport and scissor rectangle, keeping
-        //   the rest (an M4). The runtime takes the first two exactly, and in the third keeps
-        //   the tiles outside its draws' viewports and scissors, clearing or rewriting the tiles
-        //   inside them that no primitive touches. In a pass whose load
-        //   rewrites an extended-range or padded colour's unused bits, of one sample, one layer and
-        //   32 by 32 tiles, with no rotated frame, whose draws are direct triangle lists or
-        //   strips the runtime can record again, it finds the tiles their primitives reach before
-        //   the pass from the positions its vertex functions compute, and rewrites those alone,
-        //   announcing nothing, once each draw's capture form is made; the runtime makes that form
-        //   on its own threads, so a pipeline's first passes still take the viewports and
-        //   scissors, and announce. Its tiles are the pass's, as Metal's grid
-        //   is: its `tileWidth` and `tileHeight`, or the default for its
-        //   samples. A pass at a sample count with no measured default takes every tile, and so
-        //   does a load pass's rewrite under a tile size other than 32 by 32. A rotated frame, a
-        //   colour held in sample planes, and a pass through a rate map, with an execution of
-        //   render commands or with a tile dispatch, still take every tile. A tile it clears
-        //   takes the texel a `Clear` of (0, 0, 0, 0) writes, an extended-range format's own
-        //   zero, which reads 0, as Metal's. Pending a decision: the runtime's in-place load of the
-        //   tiles no draw reaches is the exact form. The runtime announces
-        //   `UnreachedTilesRewritten` and `ExtendedRangeBitsKept` for a bfloat attachment too,
-        //   whose codes it moves through `half` or keeps
-        //   otherwise than Metal, so a draw in a pass that loads and stores one dies first
-        //   (`encode_render`'s `bfloat_loaded`).
+        // - `DontCareLoadTiles` and `ExtendedRangeBitsKept`: the bytes a pass leaves where its
+        //   draws write nothing, announced at a pass Metal runs. Metal's `DontCare` load zeroes
+        //   every tile in a pass of one layer with a draw call that clears and stores an
+        //   attachment, none in a pass whose draws draw nothing and that clears and stores none,
+        //   and else the tiles a draw's primitive reaches within that draw's viewport and scissor
+        //   rectangle, keeping the rest (an M4). The runtime takes the first two exactly, and in
+        //   the third keeps the tiles outside its draws' viewports and scissors, clearing the
+        //   tiles inside them that no primitive touches. Its tiles are the pass's, as Metal's grid
+        //   is: its `tileWidth` and `tileHeight`, or the default for its samples. A pass at a
+        //   sample count with no measured default takes every tile. A rotated frame, a colour held
+        //   in sample planes, and a pass through a rate map, with an execution of render commands
+        //   or with a tile dispatch, still take every tile. A tile it clears takes the texel a
+        //   `Clear` of (0, 0, 0, 0) writes, an extended-range format's own zero, which reads 0, as
+        //   Metal's. Pending a decision: the runtime's in-place load of the tiles no draw reaches
+        //   is the exact form. A pass that loads and stores an extended-range, padded 10-bit or
+        //   bfloat colour and draws keeps the bytes its draws do not write, the device's own load
+        //   and store, where Metal's writes each tile a draw reaches back with the bits its codes
+        //   leave unused made canonical and a bfloat code moved through `half`: each draw
+        //   announces `ExtendedRangeBitsKept`. A bfloat attachment's codes are values, so a draw in
+        //   a pass that loads and stores one dies first (`encode_render`'s `bfloat_loaded`).
         // - `DrawnDepthCopy`: a copy into a multisampled depth texture, or a pass's copies of a
         //   separate depth texture through its scratch image, which a fragment-depth draw writes
         //   where Metal copies the bytes: no copy of the device keeps a multisampled depth's
@@ -2509,13 +2501,12 @@ mod tests {
         //   before this platform adopts the device's class ([`crate::gpu::device`]'s `adopt`), where
         //   a kind of [`DIES`] would die in strict mode on every native device's first creation:
         //   relayed instead, the same answer on every device.
-        const PRECISION: [D; 12] = [
+        const PRECISION: [D; 11] = [
             D::UncalibratedGpuTimes,
             D::UntimedCommandBuffer,
             D::GpuTimesFromHost,
             D::DontCareLoadTiles,
             D::ExtendedRangeBitsKept,
-            D::UnreachedTilesRewritten,
             D::DrawnDepthCopy,
             D::UnnamedShadowedTexture,
             D::UnmeasuredUniqueIdentifier,

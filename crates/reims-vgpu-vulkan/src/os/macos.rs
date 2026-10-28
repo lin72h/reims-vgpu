@@ -118,8 +118,12 @@ pub fn default_gpu_core_count() -> Option<u64> {
 #[derive(Debug)]
 pub struct GuestMemoryLease;
 
-/// The lease of the guest's RAM a device holds: nothing on Mach ([`GuestMemoryLease`]).
-pub fn lease_guest_memory(_: impl IntoIterator<Item = super::GuestRamFile>) -> GuestMemoryLease {
+/// The lease of the guest's RAM a device holds: nothing on Mach ([`GuestMemoryLease`]). A
+/// device's dirty log is not used: the Mac's GPUs read the guest's RAM in place.
+pub fn lease_guest_memory(
+    _: impl IntoIterator<Item = super::GuestRamFile>,
+    _: Option<std::sync::Arc<reims_vgpu_core::memory::dirty::DirtyLog>>,
+) -> GuestMemoryLease {
     GuestMemoryLease
 }
 
@@ -179,7 +183,7 @@ pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView
 /// # Safety
 ///
 /// `rt::HostMemory::new`'s contract, for the memory at `at`.
-pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>) -> rt::HostMemory {
+pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>, _logged: bool) -> rt::HostMemory {
     // SAFETY: the caller's.
     unsafe { rt::HostMemory::new(at) }
 }

@@ -1258,27 +1258,17 @@ pub(crate) fn open(
 /// `RGBA16Bfloat`) that the pass loads (`Load`) and stores (any store action but `DontCare`), if
 /// any, named: a draw (of anything, or of nothing), an execution of render commands or a tile
 /// dispatch in the pass dies ([`RenderEncoderObject::bfloat_drawn`]), where Metal's draws. The
-/// runtime draws into a bfloat attachment, holding its codes as `half` values in the pass as
-/// Metal's tile memory does, and its load pass moves each code of the tiles Metal's tile store
-/// writes back through `half` as Metal's does (NaNs to `0x7fc0`; the runtime's measurement on an
-/// M4: every tile where a colour attachment is cleared and stored, else those a draw's primitives
-/// reach). What a pass leaves in the tiles is still not always Metal's:
-/// - where the runtime does not find the tiles the draws' primitives reach (the passes
-///   [`crate::answer`] lists, a pipeline's first passes among them), its load pass moves the
-///   codes of every tile within the draws' viewports and scissors, announcing
-///   `unreached-tiles-rewritten`, where Metal's tile store keeps the codes of the tiles no
-///   primitive reaches;
-/// - one its load pass does not take (multisampled, held as a shadow, sparse) keeps its codes,
-///   where Metal moves the codes of the tiles a draw reaches through `half`
-///   (`extended-range-bits-kept`).
+/// runtime draws into a bfloat attachment, and the pass keeps the codes its draws do not write,
+/// the device's own load and store, where Metal's tile store writes each code of the tiles a
+/// draw's primitives reach back through `half` (NaNs to `0x7fc0`; the runtime's measurement on an
+/// M4 and an M3 Max), announcing `extended-range-bits-kept`.
 ///
-/// Both kinds are relayed for the extended-range formats on their guest reach
-/// ([`crate::answer`]), where only bytes no Metal write leaves tell them apart. That ground does
-/// not hold for bfloat: a kernel's write or a fill leaves codes `half` does not hold, and no guest
-/// is known to draw into a bfloat attachment. The runtime announces each kind once a device, not
-/// at the pass that meets it, so every such pass dies, those the runtime keeps Metal's among
-/// them. Each such death is strict mode's: by default the draw relays it
-/// ([`crate::answer::Inexact::BfloatLoaded`]).
+/// That kind is relayed for the extended-range formats on their guest reach ([`crate::answer`]),
+/// where only bytes no Metal write leaves tell them apart. That ground does not hold for bfloat:
+/// a kernel's write or a fill leaves codes `half` does not hold, and no guest is known to draw
+/// into a bfloat attachment. The runtime announces the kind once a device, not at the pass that
+/// meets it, so every such pass dies, those whose codes are Metal's among them. Each such death
+/// is strict mode's: by default the draw relays it ([`crate::answer::Inexact::BfloatLoaded`]).
 fn bfloat_loaded(d: &rt::RenderPassDescriptor) -> Option<String> {
     d.color_attachments
         .iter()
@@ -2083,11 +2073,8 @@ impl VulkanRenderEncoder {
             crate::answer::inexact(sel, crate::answer::Inexact::BfloatLoaded, || {
                 format!(
                     "a draw in a pass that loads and stores the bfloat {attachment}, whose codes \
-                     the runtime moves through half in tiles no draw reaches where it does not \
-                     find the draws' reach (unreached-tiles-rewritten), or keeps in tiles a draw \
-                     reaches where its load pass does not take the attachment \
-                     (extended-range-bits-kept), where Metal's tile store moves those a draw \
-                     reaches and keeps the rest"
+                     the pass keeps where its draws do not write them (extended-range-bits-kept), \
+                     where Metal's tile store moves those of the tiles a draw reaches through half"
                 )
             });
         }

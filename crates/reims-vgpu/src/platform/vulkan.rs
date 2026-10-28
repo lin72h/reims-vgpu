@@ -1,6 +1,7 @@
 //! `VulkanPlatform` as an `ApiPlatform` (feature `vulkan`): the runtime's devices, on macOS over
 //! MoltenVK and on Linux natively.
 
+use reims_vgpu_core::memory::dirty::DirtyLog;
 use reims_vgpu_core::num::ToU64 as _;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_vulkan::VulkanPlatform;
@@ -44,19 +45,26 @@ impl ApiPlatform for VulkanPlatform {
     /// (`reims_vgpu_vulkan::os::lease_guest_memory`): on Linux the platform makes its views of the
     /// guest's pages of them. A range without a file is not registered, and a view of its pages
     /// is refused as a failed remap is. On macOS nothing is registered, since Mach makes a view
-    /// by remapping addresses.
-    fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
+    /// by remapping addresses. Each range carries its guest physical address, and with the
+    /// device's dirty log the platform finds the guest pages behind an import and the log they
+    /// stamp (`reims_vgpu_vulkan::os::dirty`).
+    fn guest_memory(
+        &self,
+        map: &MemoryMap,
+        dirty: Option<Arc<DirtyLog>>,
+    ) -> Box<dyn Any + Send + Sync> {
         let ranges = map.ranges().iter().zip(map.files());
         let files = ranges.filter_map(|(range, file)| {
             let file = file.as_ref()?;
             Some(GuestRamFile {
                 host: range.host_address.addr().to_u64(),
+                guest: range.physical_address,
                 length: range.physical_length,
                 fd: Arc::clone(&file.fd),
                 offset: file.offset,
             })
         });
-        Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files))
+        Box::new(reims_vgpu_vulkan::os::lease_guest_memory(files, dirty))
     }
 
     /// Each plane the surface was made with (`reims_vgpu_vulkan::os::plane_layout`): on Linux

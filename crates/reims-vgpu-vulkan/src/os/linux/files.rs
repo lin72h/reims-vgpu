@@ -32,6 +32,7 @@ use std::collections::BTreeMap;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
+use reims_vgpu_core::memory::dirty::DirtyLog;
 use reims_vgpu_core::num::ToU64 as _;
 use reims_vgpu_core::sync::Mutex;
 
@@ -424,12 +425,21 @@ impl Registration {
 #[derive(Debug)]
 pub struct GuestMemoryLease {
     _registrations: Vec<Registration>,
+    /// The ranges registered for the device's dirty log (`super::dirty`).
+    _dirty: Option<super::dirty::Registered>,
 }
 
 /// Registers each range of the guest's RAM the host names a file behind: counted where the same
 /// range was registered already over the same descriptor (module docs). Warns where the views'
-/// budget of mappings is short of the guest's RAM (the `budget` module).
-pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> GuestMemoryLease {
+/// budget of mappings is short of the guest's RAM (the `budget` module). With `dirty`, the
+/// device's dirty log, each range is registered for it too, at its guest physical address
+/// (`super::dirty`).
+pub fn lease_guest_memory(
+    ranges: impl IntoIterator<Item = GuestRamFile>,
+    dirty: Option<Arc<DirtyLog>>,
+) -> GuestMemoryLease {
+    let ranges: Vec<GuestRamFile> = ranges.into_iter().collect();
+    let dirty = dirty.map(|log| super::dirty::register(&ranges, &log));
     let registrations: Vec<Registration> = ranges
         .into_iter()
         .map(|r| {
@@ -447,6 +457,7 @@ pub fn lease_guest_memory(ranges: impl IntoIterator<Item = GuestRamFile>) -> Gue
     super::budget::warn_if_short(guest_ram);
     GuestMemoryLease {
         _registrations: registrations,
+        _dirty: dirty,
     }
 }
 
@@ -577,12 +588,15 @@ mod tests {
         let base = 0x7d00_0000_0000;
         let ram = |host, length, offset| GuestRamFile {
             host,
+            guest: offset,
             length,
             fd: Arc::clone(&f),
             offset,
         };
-        let lease =
-            lease_guest_memory([ram(base, 0x4000, 0), ram(base + 0x10_000, 0x2000, 0x4000)]);
+        let lease = lease_guest_memory(
+            [ram(base, 0x4000, 0), ram(base + 0x10_000, 0x2000, 0x4000)],
+            None,
+        );
         assert_eq!(
             shape(&pieces(base + 0x1000, 0x1000).unwrap()),
             [(0, 0x1000, 0x1000)]

@@ -26,19 +26,16 @@
 //! compressed one move half its texels, and a CPU `replaceRegion` then `getBytes` read zeros,
 //! not recorded here); multisample textures; levels past the first; other Apple GPU generations.
 //!
-//! **This platform today**: the runtime models the compressed blit's rule and the load pass's
-//! rewrite: a pass rewrites every tile of its draws' viewports
-//! until the draw's capture form is made, announcing `unreached-tiles-rewritten`, relayed, and a
-//! load pass it does not take (a multisampled attachment, a shadowed or sparse texture) keeps
-//! the bits, announcing `extended-range-bits-kept`, relayed. A clear to a NaN dies at the
-//! encoder, named. The tests require each other difference of this platform's bytes from Metal's
-//! to come with one of the two kinds.
+//! **This platform today**: the runtime models the compressed blit's rule. A pass that loads and
+//! stores the texture keeps the bytes its draws do not write, the device's own load and store,
+//! and each draw in it announces `extended-range-bits-kept`, relayed. A clear to a NaN dies at
+//! the encoder, named. The tests require each other difference of this platform's bytes from
+//! Metal's to come with that kind.
 //!
-//! **To answer as Metal**: the load pass's rewrite in only the tiles the draws' primitives reach
-//! from a pipeline's first pass on (capture replay made before the pass, not on the runtime's
-//! threads after it), and in the attachments it does not take today: a multisampled one (each
-//! sample's code), and a shadowed or sparse texture's image; a NaN clear's codes (0, or 384 in an
-//! `_sRGB` twin) taken into the runtime's clear.
+//! **To answer as Metal**: a rewrite of the undrawn texels' codes in the tiles the draws'
+//! primitives reach, in every attachment (each sample's code of a multisampled one, a shadowed or
+//! sparse texture's image); a NaN clear's codes (0, or 384 in an `_sRGB` twin) taken into the
+//! runtime's clear.
 
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Platform;
@@ -161,18 +158,14 @@ fn holds_metals_rule(shape: Shape, raw: &[u8], [up, copied, loaded, drawn]: &[Ve
     }
 }
 
-/// Requires `ours` to be `theirs`, or the runtime to have announced one of the extended-range
-/// kinds; answers whether they differ.
+/// Requires `ours` to be `theirs`, or the runtime to have announced `extended-range-bits-kept`;
+/// answers whether they differ.
 fn against(case: &str, ours: &[Vec<u8>], theirs: &[Vec<u8>]) -> bool {
-    let kinds = [
-        rt::Degradation::UnreachedTilesRewritten,
-        rt::Degradation::ExtendedRangeBitsKept,
-    ];
     let differ = ours != theirs;
     if differ {
         assert!(
-            kinds.into_iter().any(heard),
-            "{case}: off Metal's, with neither kind heard"
+            heard(rt::Degradation::ExtendedRangeBitsKept),
+            "{case}: off Metal's, with extended-range-bits-kept unheard"
         );
     }
     differ
@@ -181,7 +174,7 @@ fn against(case: &str, ours: &[Vec<u8>], theirs: &[Vec<u8>]) -> bool {
 /// Each extended-range format's random bytes through a blit into each of [`shapes`], a blit
 /// between two textures, a pass with no draw and a pass that draws: Metal's rule on this host in
 /// every run. This platform's bytes are Metal's, or the runtime announced
-/// `unreached-tiles-rewritten` or `extended-range-bits-kept`
+/// `extended-range-bits-kept`
 #[test]
 fn extended_range_codes_through_blits_and_loads_are_metals() {
     let metal = metal();
@@ -244,8 +237,8 @@ fn cleared<P: Platform>((p, d): (&P, &P::Device), format: u64, colour: ClearColo
 /// read back by a blit, and clears to values inside and past the formats' ranges: Metal's bytes
 /// are one value on this host in every run (a blit out of a compressed `BGRA10_XR` texture reads
 /// canonical codes; `BGR10_XR` keeps every bit). This platform's are Metal's, or the runtime
-/// announced `unreached-tiles-rewritten` or `extended-range-bits-kept`; a clear to a NaN among
-/// them, where Metal stores a code (0, or 384 in an `_sRGB` twin), as the runtime does
+/// announced `extended-range-bits-kept`; a clear to a NaN among them, where Metal stores a code
+/// (0, or 384 in an `_sRGB` twin), as the runtime does
 #[test]
 fn extended_range_cpu_uploads_and_clears_are_metals() {
     let metal = metal();

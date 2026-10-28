@@ -53,7 +53,7 @@ Every struct the host fills in, and every struct the library hands out, starts w
   - fields past `struct_size` read as zero;
   - a `struct_size` above the library's is accepted when every byte past the library's size is zero, and is `RVG_ERR_UNSUPPORTED` otherwise. A host built against a newer header then works with an older library as long as it leaves the new fields at zero.
 - **A struct that has grown** keeps its first version's size as the least it accepts, and a host built against an earlier version passes that version's size and is read as it, the later fields zero. Four have grown:
-  - `RvgDeviceConfig`, at its third version, 64 bytes. Its first ends at `callbacks`: 48 bytes, the offset of `memory_files`, which came after. A host built before `memory_files` passes 48 and is read with no files, whatever follows its config in memory (the unit tests `device::tests::a_first_version_device_config_is_48_bytes` and `a_48_byte_device_config_is_accepted`). Its second ends at `memory_files`, 56 bytes, the offset of `process_isolation_follows_guest`; a host built before that field passes 56 and is read with it false (`device::tests::isolation_following_the_guest_is_accepted`).
+  - `RvgDeviceConfig`, at its fourth version, 72 bytes. Its first ends at `callbacks`: 48 bytes, the offset of `memory_files`, which came after. A host built before `memory_files` passes 48 and is read with no files, whatever follows its config in memory (the unit tests `device::tests::a_first_version_device_config_is_48_bytes` and `a_48_byte_device_config_is_accepted`). Its second ends at `memory_files`, 56 bytes, the offset of `process_isolation_follows_guest`; a host built before that field passes 56 and is read with it false (`device::tests::isolation_following_the_guest_is_accepted`). Its third ends at `process_isolation_follows_guest`, 64 bytes with its padding, the offset of `dirty_source`; a host built before that field passes 64 and is read with no dirty source (`device::tests::a_dirty_source_lives_with_its_device`).
   - `RvgDisplayConfig`, at its second version. Its first ends at `callbacks`: 56 bytes, the offset of `window`, which came after. A host built before `window` passes 56 and is read, with no window (the unit tests `window::tests::a_first_version_display_config_is_56_bytes` and `a_56_byte_display_config_is_accepted`).
   - `RvgWindowConfig`, at its third version, 32 bytes. Its first ends at `callbacks`, 16 bytes, and a host built against it gets no mode; its second ends at `mode_height`, 24 bytes with its padding, and a host built against it gets no density (the unit tests `window::tests::a_first_version_window_config_is_16_bytes_and_has_no_mode` and `a_second_version_window_config_is_24_bytes_and_has_no_density`).
   - `RvgWindowCallbacks`, at its second version, 64 bytes. Its first ends at `close`: 56 bytes, the offset of `scroll`, which came after. A host built against it passes 56 and is read with no `scroll`, whatever follows its table in memory (the unit test `window::tests::a_first_version_window_callbacks_is_56_bytes_and_has_no_scroll`), so its scrolling comes as notches through `wheel`.
@@ -158,13 +158,13 @@ Every export is `extern "C"`: nothing unwinds out of one into the host, and a pa
 
 ## 2. The C header
 
-The header has 47 functions and every type, callback typedef and constant, with the thread and ordering rules on each callback and each function. It has no Objective-C types, no `id<…>`, no `dispatch_queue_t` and no `__OBJC__` block. The C API's tests compile it as C11, as C++17 and as Objective-C.
+The header has 48 functions and every type, callback typedef and constant, with the thread and ordering rules on each callback and each function. It has no Objective-C types, no `id<…>`, no `dispatch_queue_t` and no `__OBJC__` block. The C API's tests compile it as C11, as C++17 and as Objective-C.
 
 | group | items |
 |---|---|
 | constants | `RVG_MAX_DISPLAY_PORTS` 8, `RVG_DEVICE_MMIO_SIZE` 0x4000, the PCI facts (`RVG_PCI_VENDOR_ID` 0x106b, `RVG_PCI_DEVICE_ID` 0xeeee, `RVG_PCI_BAR_MMIO` 0, `RVG_PCI_MSI_VECTORS` 1), the status codes, `RVG_RESUME_ERROR_*`, `RVG_DISPLAY_MODE_*` flags, `RVG_PIXEL_FORMAT_*` (Metal's numbers: 70, 71, 80, 81), `RVG_WINDOW_MATCH_HOST_SCREEN` 1, `RVG_WINDOW_BUTTON_*` (1, 2, 4, 8, 16), `RVG_LOG_*` |
 | status and log | `rvg_status_message`, `rvg_log_set_handler` |
-| device | `RvgDeviceConfig`, `RvgHostCallbacks`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`; `rvg_device_create`, `_release`, `_mmio_read`, `_mmio_write`, `_reset`, `_pause`, `_unpause`, `_stop` |
+| device | `RvgDeviceConfig`, `RvgHostCallbacks`, `RvgMemoryMap`, `RvgMemoryRange`, `RvgMemoryRangeFile`, `RvgDirtySource` and its function types; `rvg_dirty_slot`, `rvg_device_create`, `_release`, `_mmio_read`, `_mmio_write`, `_reset`, `_pause`, `_unpause`, `_stop` |
 | suspend and resume | `rvg_device_will_suspend`, `_finish_suspend`, `_will_resume`, `_did_resume`, `rvg_bytes_free` |
 | displays | `RvgDisplayConfig`, `RvgDisplayCallbacks`, `RvgDisplayMode`, `RvgCursorGlyph`; `rvg_display_create`, `_release`, `_set_modes`, `_cursor_position`, `_present_counts` |
 | a display's window | `RvgWindowConfig`, `RvgWindowCallbacks`, `RvgWindowPointerFn`, `RvgWindowWheelFn`, `RvgWindowKeyFn`, `RvgWindowCloseFn`, `RvgWindowScrollFn`, `RvgWindowScroll`; no function of its own: `RvgDisplayConfig.window` carries it |
@@ -253,6 +253,8 @@ Everything a host can set that shapes what the guest is offered or what the libr
   | `REIMS_VGPU_EXACT` | the Vulkan platform: the runtime's exact forms in place of its fast ones, by field ("The Vulkan platform's exact forms", above) |
   | `REIMS_VGPU_CENSUS_DIR` | the Vulkan platform on Linux, a diagnostic for inventory runs: each difference that would end the process is recorded in that directory and logged instead, and the run says it is not faithful to Metal; ignored on macOS |
   | `REIMS_VGPU_TRACE` | the Vulkan platform, a diagnostic for profiling: a timeline of the device's work, a line per event, written to the file it names (core's `trace` module); the Metal platform writes nothing |
+  | `REIMS_VGPU_DIRTY_PAGE_TRACKING` | `0`: a device takes no host's dirty source (`RvgDeviceConfig.dirty_source`), so the Vulkan runtime copies each use of the guest's RAM whole |
+  | `REIMS_VGPU_DIRTY_WRITERS` | the Vulkan platform on Linux, with a dirty source: `0` makes a shadow's copy in take the pages its own copy back wrote, as it takes every other writer's |
   | `REIMS_VGPU_TRACE_DEGRADE` | with `REIMS_VGPU_TRACE`, `1`: every occurrence of every difference from Metal the runtime announces is written to the trace; the log is as without it |
 
   `REIMS_VGPU_WINDOW` is QEMU's, not the library's: `0` keeps `apple-gfx` headless under `-display none` (docs/qemu.md, "Window mode"). Of these, only `REIMS_VGPU_STRICT`, `REIMS_VGPU_EXACT` and `REIMS_VGPU_CENSUS_DIR` change what the guest or host observes, and only on the Vulkan platform (the trace's two change only the trace and the log lines); `REIMS_VGPU_WINDOW_SCREENS` and `_REFRESH` change the modes a window display with `RVG_WINDOW_MATCH_HOST_SCREEN` offers its guest.
@@ -657,57 +659,58 @@ With the `testkit` feature, `Device`, `Display` and `IoSurfaceDevice` also give 
 
 ## 4. The functions
 
-The header's 47 functions, in its order. "May" is the header's mark "may call back": the device's callbacks may run on the calling thread before the function returns. A function without the mark never runs one there. A release may also run its table's `destroy` on the calling thread (section 5).
+The header's 48 functions, in its order. "May" is the header's mark "may call back": the device's callbacks may run on the calling thread before the function returns. A function without the mark never runs one there. A release may also run its table's `destroy` on the calling thread (section 5).
 
 | # | function | calls back | what it does |
 |---|---|---|---|
 | 1 | `rvg_status_message` | | a static description of a status; any thread, inside any callback |
 | 2 | `rvg_log_set_handler` | | sends the library's log lines to the host's function (section 2) |
-| 3 | `rvg_device_create` | | a device, from an `RvgDeviceConfig` |
-| 4 | `rvg_device_release` | may | drops the host's reference; the last reference is the teardown |
-| 5 | `rvg_device_mmio_read` | may | a 32-bit read of the device's MMIO region |
-| 6 | `rvg_device_mmio_write` | may | a 32-bit write; a root FIFO write waits for the FIFO's thread |
-| 7 | `rvg_device_reset` | may | the guest's bus reset; returns once the device is quiesced |
-| 8 | `rvg_device_pause` | may | each FIFO finishes the commands it started and stops, then the guest's displays pause |
-| 9 | `rvg_device_unpause` | may | unpauses the guest's displays, starts every FIFO and raises one interrupt |
-| 10 | `rvg_device_stop` | may | stops the device as a root page of 0 does: its FIFOs, the guest's tasks and display pages are torn down |
-| 11 | `rvg_device_will_suspend` | may | starts a suspend: no interrupt is raised from here; it quiesces the FIFOs without waiting |
-| 12 | `rvg_device_finish_suspend` | may | ends it: the state as `RvgBytes`; the guest's tasks end and its displays pause |
-| 13 | `rvg_bytes_free` | | frees what `finish_suspend` wrote |
-| 14 | `rvg_device_will_resume` | may | offers a state: `RVG_OK`, or `RVG_ERR_RESUME` with the reason |
-| 15 | `rvg_device_did_resume` | may | ends an accepted resume |
-| 16 | `rvg_display_create` | may | a display on a port, from an `RvgDisplayConfig` |
-| 17 | `rvg_display_release` | may | drops the host's reference; the last one unplugs the display |
-| 18 | `rvg_display_set_modes` | may | offers the guest a list of modes, copied, of which its display page takes the first 128; 0 modes changes nothing |
-| 19 | `rvg_display_cursor_position` | | the cursor's position; {65535, 65535} before the guest links the display |
-| 20 | `rvg_display_present_counts` | | the guest's presents and the host's new-frame encodes |
-| 21 | `rvg_frame_target_create` | | a frame target on the device's Metal device |
-| 22 | `rvg_frame_target_retain` | | one more reference |
-| 23 | `rvg_frame_target_release` | | drops one reference |
-| 24 | `rvg_frame_target_read_pixels` | | copies the whole target into host memory |
-| 25 | `rvg_display_encode_frame` | | encodes the current frame into a target: an uncommitted frame |
-| 26 | `rvg_frame_commit` | | submits it to the GPU |
-| 27 | `rvg_frame_wait` | | waits for it: `RVG_OK` or `RVG_ERR_GPU` |
-| 28 | `rvg_frame_release` | | drops it; an uncommitted frame stays counted in flight for the display's life |
-| 29 | `rvg_iosurface_device_create` | | the IOSurface device, the process's latest |
-| 30 | `rvg_iosurface_device_release` | | its teardown, which waits for its thread |
-| 31 | `rvg_iosurface_device_mmio_read` | | a 64-bit read of its registers (0x1000 to 0x1030); other offsets read all ones |
-| 32 | `rvg_iosurface_device_mmio_write` | | a 64-bit write; other offsets are ignored |
-| 33 | `rvg_trace_range_handler_invoke` | | tells the device the guest wrote a traced range |
-| 34 | `rvg_trace_range_handler_retain` | | one more reference |
-| 35 | `rvg_trace_range_handler_release` | | drops one reference |
-| 36 | `rvg_video_device_create` | | the video device (106b:1a03), from an `RvgVideoDeviceConfig`, with no host session yet; its codecs open on the backend the library picks and logs: VideoToolbox on macOS, on Linux NVIDIA's or VA-API on the GPU the GPU device runs on, else on the host's first hardware GPU that offers video (docs/video/backends.md, "Picking a backend"); none where no backend opens, and the guest is offered no codec |
-| 37 | `rvg_video_device_release` | | drops the host's reference; the last one resets the device |
-| 38 | `rvg_video_device_start` | | the guest's DRIVER_OK: a new host session |
-| 39 | `rvg_video_device_deliver` | may | one message of queue 0: its `subs` surfaces held while the session needs them, the session's status answered; `RVG_VIDEO_INVALID_SESSION` with no session; `RVG_VIDEO_ALLOCATION_FAILED` for a message over `RVG_VIDEO_MAX_MESSAGE_SIZE`, which the session never sees |
-| 40 | `rvg_video_device_invalidate` | | a reset's first phase: the session sends the guest nothing more |
-| 41 | `rvg_video_device_reset` | | both phases: the session's work drains and it ends |
-| 42 | `rvg_scaler_device_create` | | the M2 scaler device (106b:1a0b), from an `RvgScalerDeviceConfig`, made on every host: transforming with the library's own kernel on the GPU it draws with (Metal's on macOS, the Vulkan platform's on Linux, any GPU, a software rasterizer included), and with none where that opens no device or the device refuses the kernel |
-| 43 | `rvg_scaler_device_release` | | drops the host's reference; the last one drops its accelerator and ends its guest-memory table |
-| 44 | `rvg_scaler_device_scales` | | whether the device has a GPU to transform on; where it has not, the host refuses the guest's features (FEATURES_OK), so the guest's driver does without the device |
-| 45 | `rvg_scaler_device_start` | | the guest's DRIVER_OK: a new accelerator; false where none can be made, as on a device that does not scale, a needs-reset |
-| 46 | `rvg_scaler_device_process` | may | one element of the queue, answered in place: `RVG_SCALER_REPLY`, `_NEEDS_RESET` or `_END_VM`, with Apple's reason for the last two |
-| 47 | `rvg_scaler_device_reset` | | a reset or a stop: the accelerator goes |
+| 3 | `rvg_dirty_slot` | | reports one logged KVM memory slot to the library, from inside a dirty source's `for_each_slot`, with the `slot_ctx` it was given |
+| 4 | `rvg_device_create` | | a device, from an `RvgDeviceConfig` |
+| 5 | `rvg_device_release` | may | drops the host's reference; the last reference is the teardown |
+| 6 | `rvg_device_mmio_read` | may | a 32-bit read of the device's MMIO region |
+| 7 | `rvg_device_mmio_write` | may | a 32-bit write; a root FIFO write waits for the FIFO's thread |
+| 8 | `rvg_device_reset` | may | the guest's bus reset; returns once the device is quiesced |
+| 9 | `rvg_device_pause` | may | each FIFO finishes the commands it started and stops, then the guest's displays pause |
+| 10 | `rvg_device_unpause` | may | unpauses the guest's displays, starts every FIFO and raises one interrupt |
+| 11 | `rvg_device_stop` | may | stops the device as a root page of 0 does: its FIFOs, the guest's tasks and display pages are torn down |
+| 12 | `rvg_device_will_suspend` | may | starts a suspend: no interrupt is raised from here; it quiesces the FIFOs without waiting |
+| 13 | `rvg_device_finish_suspend` | may | ends it: the state as `RvgBytes`; the guest's tasks end and its displays pause |
+| 14 | `rvg_bytes_free` | | frees what `finish_suspend` wrote |
+| 15 | `rvg_device_will_resume` | may | offers a state: `RVG_OK`, or `RVG_ERR_RESUME` with the reason |
+| 16 | `rvg_device_did_resume` | may | ends an accepted resume |
+| 17 | `rvg_display_create` | may | a display on a port, from an `RvgDisplayConfig` |
+| 18 | `rvg_display_release` | may | drops the host's reference; the last one unplugs the display |
+| 19 | `rvg_display_set_modes` | may | offers the guest a list of modes, copied, of which its display page takes the first 128; 0 modes changes nothing |
+| 20 | `rvg_display_cursor_position` | | the cursor's position; {65535, 65535} before the guest links the display |
+| 21 | `rvg_display_present_counts` | | the guest's presents and the host's new-frame encodes |
+| 22 | `rvg_frame_target_create` | | a frame target on the device's Metal device |
+| 23 | `rvg_frame_target_retain` | | one more reference |
+| 24 | `rvg_frame_target_release` | | drops one reference |
+| 25 | `rvg_frame_target_read_pixels` | | copies the whole target into host memory |
+| 26 | `rvg_display_encode_frame` | | encodes the current frame into a target: an uncommitted frame |
+| 27 | `rvg_frame_commit` | | submits it to the GPU |
+| 28 | `rvg_frame_wait` | | waits for it: `RVG_OK` or `RVG_ERR_GPU` |
+| 29 | `rvg_frame_release` | | drops it; an uncommitted frame stays counted in flight for the display's life |
+| 30 | `rvg_iosurface_device_create` | | the IOSurface device, the process's latest |
+| 31 | `rvg_iosurface_device_release` | | its teardown, which waits for its thread |
+| 32 | `rvg_iosurface_device_mmio_read` | | a 64-bit read of its registers (0x1000 to 0x1030); other offsets read all ones |
+| 33 | `rvg_iosurface_device_mmio_write` | | a 64-bit write; other offsets are ignored |
+| 34 | `rvg_trace_range_handler_invoke` | | tells the device the guest wrote a traced range |
+| 35 | `rvg_trace_range_handler_retain` | | one more reference |
+| 36 | `rvg_trace_range_handler_release` | | drops one reference |
+| 37 | `rvg_video_device_create` | | the video device (106b:1a03), from an `RvgVideoDeviceConfig`, with no host session yet; its codecs open on the backend the library picks and logs: VideoToolbox on macOS, on Linux NVIDIA's or VA-API on the GPU the GPU device runs on, else on the host's first hardware GPU that offers video (docs/video/backends.md, "Picking a backend"); none where no backend opens, and the guest is offered no codec |
+| 38 | `rvg_video_device_release` | | drops the host's reference; the last one resets the device |
+| 39 | `rvg_video_device_start` | | the guest's DRIVER_OK: a new host session |
+| 40 | `rvg_video_device_deliver` | may | one message of queue 0: its `subs` surfaces held while the session needs them, the session's status answered; `RVG_VIDEO_INVALID_SESSION` with no session; `RVG_VIDEO_ALLOCATION_FAILED` for a message over `RVG_VIDEO_MAX_MESSAGE_SIZE`, which the session never sees |
+| 41 | `rvg_video_device_invalidate` | | a reset's first phase: the session sends the guest nothing more |
+| 42 | `rvg_video_device_reset` | | both phases: the session's work drains and it ends |
+| 43 | `rvg_scaler_device_create` | | the M2 scaler device (106b:1a0b), from an `RvgScalerDeviceConfig`, made on every host: transforming with the library's own kernel on the GPU it draws with (Metal's on macOS, the Vulkan platform's on Linux, any GPU, a software rasterizer included), and with none where that opens no device or the device refuses the kernel |
+| 44 | `rvg_scaler_device_release` | | drops the host's reference; the last one drops its accelerator and ends its guest-memory table |
+| 45 | `rvg_scaler_device_scales` | | whether the device has a GPU to transform on; where it has not, the host refuses the guest's features (FEATURES_OK), so the guest's driver does without the device |
+| 46 | `rvg_scaler_device_start` | | the guest's DRIVER_OK: a new accelerator; false where none can be made, as on a device that does not scale, a needs-reset |
+| 47 | `rvg_scaler_device_process` | may | one element of the queue, answered in place: `RVG_SCALER_REPLY`, `_NEEDS_RESET` or `_END_VM`, with Apple's reason for the last two |
+| 48 | `rvg_scaler_device_reset` | | a reset or a stop: the accelerator goes |
 
 QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), the suite's runner 33 (all but `rvg_log_set_handler` and `rvg_frame_target_retain`), and the C harness (`tests/c/harness.c`) all 47, the scaler's process and reset after a start only where the device scales (elsewhere it checks that the start fails). What the runner leaves out is covered in the C API's tests: `api.log.handler` pins the log hook, and `frame::tests::a_retained_target_lives_until_its_last_release` checks that a retained target keeps its texture until its last release.
 
@@ -725,11 +728,12 @@ QEMU's `apple-gfx` calls 21 of them (docs/qemu.md), the suite's runner 33 (all b
 | a window's `pointer`, `wheel`, `key`, `close`, `scroll` | on macOS the process's main thread, where AppKit runs; on Linux the library's thread `reims-vgpu.ui`; never inside a call of the host's | every window callback of the process: one at a time | the order the events arrived |
 | IOSurface `raise_interrupt` | the IOSurface device's own thread | itself | the ring's order |
 | video `send_to_guest` | the host session's threads, or the host's own inside `rvg_video_device_deliver` | nothing: the host copies each message and keeps the calls' order for the guest | the session's |
+| dirty source `start`, `flush_vcpus`, `for_each_slot` (and the `rvg_dirty_slot` calls inside it), `take_host_writes` | the device's harvest thread, `reims-vgpu.dirty`; never inside a call of the host's | the device's harvests: one at a time | each harvest's: `start` once, before the first; then `flush_vcpus` (only where `pml` is on), `for_each_slot`, inside each `rvg_dirty_slot` the slot's `KVM_GET_DIRTY_LOG`, `KVM_CLEAR_DIRTY_LOG` and `take_host_writes` |
 | scaler `is_ram`, `read`, `write` | the host's own, inside `rvg_scaler_device_process` | the host's calls of `rvg_scaler_device_process` | the request's: Apple's checks, then its gathers, then its scatters |
 | `destroy` (each table) | whichever thread drops the last reference: the host's in a release or a refused create, or a library thread; a window table's, the releasing thread, or the window's thread (the main thread on macOS, `reims-vgpu.ui` on Linux) | nothing | once, after every call of its table |
 | the log handler | any | nothing | none |
 
-Threads and queues are named `reims-vgpu.<role>`: `reims-vgpu.fifo` (a FIFO's thread), `reims-vgpu.fifo-control`, `reims-vgpu.reporting`, `reims-vgpu.efi-present`, `reims-vgpu.display`, `reims-vgpu.iosurface`, `reims-vgpu.release`, `reims-vgpu.timer`, `reims-vgpu.window` (a window's drawing thread), `reims-vgpu.ui` (on Linux, the thread every window's events and callbacks run on), `reims-vgpu.stats` (the frame statistics' reporter, with `REIMS_VGPU_STATS`), an isolated task's `reims-vgpu.task-service`, `reims-vgpu.task-connection` and `reims-vgpu.task-link`, and the video device's host session's, which its crate names `reims-vgpu-video.<role>`: `decoder`, `decoder-copy`, `encoder`, `motion`, `jpeg` and `imports` (Linux keeps 15 bytes of a name, `reims-vgpu-vide`). The names are diagnostics, not contract. A queue's worker, the display thread among them, has core's `WORKER_STACK`, 512 KiB.
+Threads and queues are named `reims-vgpu.<role>`: `reims-vgpu.fifo` (a FIFO's thread), `reims-vgpu.fifo-control`, `reims-vgpu.reporting`, `reims-vgpu.efi-present`, `reims-vgpu.display`, `reims-vgpu.iosurface`, `reims-vgpu.release`, `reims-vgpu.timer`, `reims-vgpu.window` (a window's drawing thread), `reims-vgpu.ui` (on Linux, the thread every window's events and callbacks run on), `reims-vgpu.stats` (the frame statistics' reporter, with `REIMS_VGPU_STATS`), `reims-vgpu.dirty` (a device's harvest of its host's dirty source), an isolated task's `reims-vgpu.task-service`, `reims-vgpu.task-connection` and `reims-vgpu.task-link`, and the video device's host session's, which its crate names `reims-vgpu-video.<role>`: `decoder`, `decoder-copy`, `encoder`, `motion`, `jpeg` and `imports` (Linux keeps 15 bytes of a name, `reims-vgpu-vide`). The names are diagnostics, not contract. A queue's worker, the display thread among them, has core's `WORKER_STACK`, 512 KiB.
 
 ### The order of VM-memory operations is core's
 
@@ -848,7 +852,7 @@ A host of this API cannot observe, and the suite does not record:
 
 - **The header.** `cargo xtask header` regenerates `include/reims_vgpu.h` with cbindgen 0.29.4, and `--check`, part of `cargo xtask check`, fails when the committed header differs from cbindgen's output. A different cbindgen version is reported, not compared. The C API's `header_has_no_drift` test runs the same comparison when cbindgen 0.29.4 is installed.
 - **The exports** (`tests/exports.rs`): every export is `#[unsafe(no_mangle)] pub [unsafe] extern "C" fn rvg_…` whose whole body is one call of `ffi::export`; no other function or function-pointer type of the product code has a C ABI, except the host's callback types, which are `extern "C-unwind"` for `ffi::host_call`'s catch; the header declares exactly the exports, and the dylib exports every one.
-- **The C harness** (`tests/c_harness.rs`) builds `tests/c/harness.c` against the committed header with `-std=c11 -Wall -Wextra -Werror -pedantic`, links it to the crate's dylib and runs it. It checks that the header declares 47 functions and that the harness calls each, and that the header compiles alone as C++17 and as Objective-C.
+- **The C harness** (`tests/c_harness.rs`) builds `tests/c/harness.c` against the committed header with `-std=c11 -Wall -Wextra -Werror -pedantic`, links it to the crate's dylib and runs it. It checks that the header declares 48 functions and that the harness calls each, and that the header compiles alone as C++17 and as Objective-C.
 - **The pins** (`tests/pins`): `api_pins.c`, a C program a host could be, pins what the suite's records do not show: the order, arguments and thread of the device's callbacks; each table's `destroy`; the display thread; a display kept alive through a frame; a display with a window created and released in a process whose main thread runs no run loop (`api.window.no_run_loop`); `add_trace_range` alone as a refusal; the registers a fresh device reads, a resume's refusals and a display's first cursor position; the EFI display's traced range; resume-child writes (0x1028) of IDs past the 64 child FIFOs; the feature level and the connection types as the guest reads them; the log hook; and the deaths that remain. `tests/pins/main.rs` compares its output with `expected.tsv`, and `RVG_PINS_RECORD=1` records it again.
 - **The suite** drives the API through the runner (section 7), against its expected files (docs/testing.md).
 - **Versioning.** A change to the API is additive (section 1).

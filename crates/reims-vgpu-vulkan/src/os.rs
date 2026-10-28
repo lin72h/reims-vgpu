@@ -28,6 +28,10 @@ use macos as host_os;
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
+/// The dirty source's side on Linux: the device's log, the harvester's interface, and the
+/// per-import answers the runtime asks (`os/linux/dirty.rs`).
+#[cfg(target_os = "linux")]
+pub use host_os::dirty;
 /// The loader the runtime opens, for `crate::host_gpus`'s own instances.
 #[cfg(target_os = "linux")]
 pub(crate) use host_os::open_loader;
@@ -65,6 +69,8 @@ pub(crate) use surface::{
 pub struct GuestRamFile {
     /// The host address of the range's first byte.
     pub host: u64,
+    /// The guest physical address of the range's first byte.
+    pub guest: u64,
     /// The range's length in bytes.
     pub length: u64,
     /// The file.

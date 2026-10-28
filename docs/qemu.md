@@ -98,6 +98,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | window mode: under `-display none`, each display gets a window of the library's, whose input reaches the guest's USB tablet and keyboard; closing it powers the VM off ("Window mode", below); the guest's mode 1920x1080 by default; `resolution=<w>x<h>@<ppi>` tells the guest that density for the mode, and a density at which the guest's scale is not known from it, or a width told over 65535 mm, fails the realize ("A chosen density's boundary", below) | `54fd32d1c3`, `4ec8f35655`, `ffb8ae8b17`, `c720eb298d`, `e4228ee079`, `c1e0d866ba`, `1dc0b093c9`, `ffbf1f3cee` |
 | `vmapple` builds on upstream master: the aarch64 machine interface upstream removed is gone from it | `450e03eed2` |
 | `vmapple`'s secondary CPUs start with the pointer authentication keys of the CPU that powers them on (an opt-in Arm CPU property, `cpu-on-copies-pauth-keys`, which `vmapple` sets), so a macOS guest runs on every vCPU ("Every vCPU of the guest", below) | `f116a9d560`, `c912618391` |
+| `apple-gfx`'s dirty source under KVM: the VM's fd and four callbacks (start the RAM's log, flush the vCPUs' page-modification logs through `CPUState.kvm_run_seq`, walk the logged slots, take QEMU's own writes from its `DIRTY_MEMORY_VGA` bitmap), with which the library reads and clears the guest RAM's dirty log itself ("Linux hosts: the dirty source", below) | `01650c7f08` |
 | smooth scrolling: the input layer's `scroll` events (`qemu_input_queue_scroll`, `qemu_input_scrolls_smoothly`, QMP `input-send-event`); `usb-vmapple-tablet`, Virtualization.framework's USB pointing device, which a macOS guest scrolls as a trackpad; `vmapple`'s `tablet` property, `usb-vmapple-tablet` by default; the windows' scroll callback sent as smooth scroll events, or as notches to a device without them ("Measured facts about driving it", below) | `840feb5ced`, `c2f5832f32`, `674af72fe2`, `3dd8c62445`, `da640879f0`, `e0ce93da92`, `d46ebaa252`, `61f7de5fc1`, `fc46f8bf02`, `797c366c0f` |
 | vmapple boots macOS 14 and later guests, with no option: when iBoot enters the kernel, which the machine sees through `hvf_arm_exec_fault`, a hook HVF calls on an instruction fetch's stage 2 fault, it takes the kernel's waits on failed pointer authentication hypercalls out of its code, and adds `/filesystems` with `DoNotUseSEP` to a device tree that has no `/filesystems` ("macOS 14 and later guests", below); `vmapple.rst`'s "Guest versions" | `a24c8eadfa`, `e1c37ea4d4` |
 | `apple-gfx` names each display "Reims vGPU" to the guest, which saw "QEMU display" before | `3ca83dca38` |
@@ -304,7 +305,7 @@ Realized paused on q35 under KVM, the device is 106b:1a0b, class
 `vendor/qemu`'s `apple-gfx` is three C files, `hw/display/apple-gfx.c`,
 `apple-gfx-mmio.c` and `apple-gfx-pci.c`, on the library's C API,
 `reims_vgpu.h`. They use no Objective-C, Metal, IOSurface, dispatch, blocks
-or autorelease pools, and call 21 of the header's 47 functions. Beside them,
+or autorelease pools, and call 22 of the header's 48 functions. Beside them,
 `apple-gfx-activity.m` holds Foundation's activity against App Nap while a
 device is realized, and calls nothing of the library ("App Nap", below).
 How it uses the API:
@@ -622,6 +623,40 @@ table ("The IOSurface device over PCI", above). The library then runs each
 isolated guest task on threads of its own in QEMU's process
 ([architecture.md](architecture.md) 5.1). QEMU starts no other process: an
 isolated task's CPU, and the Metal lines it logs, are QEMU's.
+
+### Linux hosts: the dirty source
+
+Where the Vulkan runtime keeps a copy of guest memory in GPU memory (a
+discrete GPU's texture copies, and the shadows of a GPU whose driver cannot
+use the guest's pages in place), it copies again only the pages written
+since its last copy. Under KVM, `apple-gfx` gives the device a dirty source
+(api.md, `RvgDirtySource`): the VM's fd and four callbacks, none of which
+takes the BQL. The library's thread `reims-vgpu.dirty` runs each harvest:
+it has every vCPU inside `KVM_RUN` leave it once where `kvm_intel`'s `pml`
+is on (KVM's `KVM_GET_DIRTY_LOG` kicks the vCPUs but does not wait, so a
+write logged in a vCPU's page-modification log could reach the bitmap after
+the read), then, per logged slot, one `KVM_GET_DIRTY_LOG` and one
+`KVM_CLEAR_DIRTY_LOG` of exactly the watched pages it shows written, then
+takes QEMU's own DMA (the M2 scaler's output, virtio) from QEMU's bitmap.
+Only watched pages are cleared, so a page no copy reads costs the guest
+nothing. The RAM is logged from the first harvest on, since KVM maps a
+logged slot 4 KiB at a time. A source needs KVM's initially-set manual
+dirty-log protection, no dirty ring, no global dirty tracking and 4 KiB
+pages; without one the runtime copies whole, as before.
+`REIMS_VGPU_DIRTY_PAGE_TRACKING=0` turns it off.
+
+Measured on msi-5080 (RTX 5080 Laptop GPU, x86-64 macOS 26 guest, a Finder
+window dragged for 20 s, PCIe traffic by `nvidia-smi dmon`, 2026-10-28),
+against the library and runtime before it:
+
+| guest mode | without | with |
+|---|---|---|
+| 1680x1050 | 56.2 fps, 182 MB a frame host to GPU, SM 65% | 55.7 fps, 98 MB, SM 46% |
+| 3840x2160 | 18.0 fps, 938 MB a frame, SM 91% | 26.1 fps, 439 MB, SM 79% |
+
+At 1680x1050 the copies do not bound the drag, and the source turns into
+headroom; at 3840x2160 they do. The same build with the source off moves
+what the build before it moved.
 
 ### Linux hosts: `vm.max_map_count`
 

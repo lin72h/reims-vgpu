@@ -6,7 +6,12 @@
 //! holds it, and a device's imports of its memory with it (reims-vgpu-video-core's
 //! `DeviceImports`); the same pages mapped again are another surface, with another identity, so
 //! no import of the one before is ever written again.
+//!
+//! The device writes into the guest's pages while the lend lives, so the lend brackets its bytes
+//! as one lasting write for the dirty log (`reims_vgpu_core::memory::dirty::host_write`): a GPU
+//! runtime's copy of them takes them as written while it lives, and by their stamp after.
 
+use reims_vgpu_core::memory::dirty::{HostWrite, host_write};
 use reims_vgpu_core::num::ToU64 as _;
 use reims_vgpu_video_core::device_memory::{
     DeviceMemory, DmaBufError, HostView, MemoryIdentity, MemoryLife, SurfaceDmaBuf,
@@ -18,6 +23,8 @@ use reims_vgpu_vulkan::os::{DeviceLend, LendRefusal, OsSurface, attachment, lend
 pub(super) struct LentMemory {
     identity: MemoryIdentity,
     lend: DeviceLend,
+    /// The dirty log's bracket of the lent bytes (module docs), ended after the lend's drop.
+    _written: HostWrite,
 }
 
 /// `surface`'s memory lent to a device; `Err` with why where it is not lent.
@@ -25,7 +32,12 @@ pub(super) fn lent_memory(surface: &OsSurface) -> Result<LentMemory, &'static st
     let lend = lend_to_devices(surface)?;
     let identity = attachment(surface, MemoryLife::new, MemoryLife::identity)
         .ok_or("a surface the host attached another value to")?;
-    Ok(LentMemory { identity, lend })
+    let written = host_write(lend.first().as_ptr().addr().to_u64(), lend.length());
+    Ok(LentMemory {
+        identity,
+        lend,
+        _written: written,
+    })
 }
 
 impl DeviceMemory for LentMemory {

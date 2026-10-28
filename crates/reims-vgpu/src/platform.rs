@@ -30,6 +30,7 @@ use std::any::Any;
 use std::sync::{Arc, OnceLock, Weak};
 
 use reims_vgpu_core::host::HostQueue;
+use reims_vgpu_core::memory::dirty::DirtyLog;
 use reims_vgpu_core::platform::device::GpuDevice as _;
 use reims_vgpu_core::platform::{Handle, ObjId, Platform};
 use reims_vgpu_core::rt::{Executor, Job, SerialQueue};
@@ -53,9 +54,16 @@ pub trait ApiPlatform: Platform {
     fn read_pixels(&self, texture: &Self::Texture, dst: &mut [u8], bytes_per_row: usize);
 
     /// What the platform holds of the guest's RAM while a device made over `map` lives: the
-    /// device takes it as it is created and drops it after core's teardown. Nothing by default.
-    fn guest_memory(&self, map: &MemoryMap) -> Box<dyn Any + Send + Sync> {
-        let _ = map;
+    /// device takes it as it is created and drops it after core's teardown. `dirty` is the
+    /// device's dirty log, for a device with a dirty source: where the platform keeps copies of
+    /// guest memory of its own, it asks the log which pages changed, and stamps there what it
+    /// writes into the guest's RAM itself. Nothing by default.
+    fn guest_memory(
+        &self,
+        map: &MemoryMap,
+        dirty: Option<Arc<DirtyLog>>,
+    ) -> Box<dyn Any + Send + Sync> {
+        let _ = (map, dirty);
         Box::new(())
     }
 
@@ -370,7 +378,7 @@ mod tests {
         // SAFETY: the guest's RAM, mapped writable above.
         unsafe { ram.as_ptr::<u8>().add(0x10).write_volatile(0x5a) };
         assert_eq!(view(ram), None, "no file is known before the lease");
-        let lease = p.guest_memory(&map);
+        let lease = p.guest_memory(&map, None);
         assert_eq!(view(ram), Some(0x5a));
         assert_eq!(view(plain), None, "a range without a file");
         drop(lease);

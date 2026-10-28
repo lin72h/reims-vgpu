@@ -1097,7 +1097,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
                     // keep-alive is dropped, as nothing else frees or remaps it.
                     unsafe {
                         (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first),
+                            crate::os::host_memory(first, true),
                             None,
                             Some(keep),
                         )
@@ -1856,7 +1856,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                     // which is the runtime's import unit on this host.
                     unsafe {
                         (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first),
+                            crate::os::host_memory(first, true),
                             None,
                             Some(keep),
                         )

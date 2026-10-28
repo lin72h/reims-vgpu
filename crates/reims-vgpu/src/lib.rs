@@ -33,6 +33,7 @@
 compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
 
 mod device;
+pub mod dirty;
 mod display;
 mod entry;
 mod error;
@@ -47,6 +48,7 @@ mod video;
 mod window;
 
 pub use device::{Device, DeviceConfig, HostCallbacks, MemoryFile, MemoryMap};
+pub use dirty::{DirtyHost, DirtySource, KvmSlot};
 pub use display::{
     CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn, Display, DisplayCallbacks,
     DisplayConfig, DisplayMode, ModeChangeFn, NewFrameFn,

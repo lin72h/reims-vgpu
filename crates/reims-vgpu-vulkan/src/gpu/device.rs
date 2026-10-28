@@ -678,7 +678,7 @@ impl VulkanDevice {
         // `HostMemory::new`'s keep-alive clause, a deviation whose ground is MoltenVK's no-copy
         // buffer keeping the pages Metal wired as it was made (`crate::remap`, "What is not ours
         // to unmap").
-        let memory = unsafe { crate::os::host_memory(base) };
+        let memory = unsafe { crate::os::host_memory(base, true) };
         let contents = rt::BufferContents::NoCopy {
             memory,
             deallocator: Some(run),
@@ -833,7 +833,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator
                 // runs, or for the buffer's life with none, and an unmap of core's through the
                 // platform's VM waits for the keep-alive; a twin of them stays until it goes.
-                let memory = unsafe { crate::os::host_memory(imported) };
+                let memory = unsafe { crate::os::host_memory(imported, bytes.logged()) };
                 let contents = rt::BufferContents::NoCopy {
                     memory,
                     deallocator: run,
@@ -1560,7 +1560,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     // deallocator runs, or for the buffer's life with none, and an unmap of
                     // core's through the platform's VM waits for the keep-alive; a twin of them
                     // stays until it goes.
-                    memory: unsafe { crate::os::host_memory(imported) },
+                    memory: unsafe { crate::os::host_memory(imported, bytes.logged()) },
                     deallocator: run,
                     keep_alive: Some(keep),
                 }
@@ -1701,7 +1701,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                             match token {
                                 Some(token) => {
                                     self.raw.new_heap_with_bytes_no_copy_and_range_token(
-                                        crate::os::host_memory(first),
+                                        crate::os::host_memory(first, true),
                                         &descriptor,
                                         None,
                                         Some(keep),
@@ -1709,7 +1709,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                                     )
                                 }
                                 None => self.raw.new_heap_with_bytes_no_copy(
-                                    crate::os::host_memory(first),
+                                    crate::os::host_memory(first, true),
                                     &descriptor,
                                     None,
                                     Some(keep),

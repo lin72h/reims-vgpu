@@ -663,7 +663,11 @@ impl<P: Platform> Drop for EfiDisplay<P> {
 }
 
 /// `newBufferWithBytesNoCopy:length:options:0 deallocator:nil` over the framebuffer mapping, for
-/// a register write (an API entry with no handler).
+/// a register write (an API entry with no handler), its bytes never watched by the device's
+/// dirty log ([`HostRange::unlogged`](crate::platform::HostRange::unlogged)): the firmware's
+/// presents would start the host's log within seconds of the boot, at the cost of the guest's
+/// huge pages for the whole run, to skip copies of a framebuffer that lives only until the
+/// guest's own driver takes the display.
 #[allow(unsafe_code)] // architecture 17.3: the call of an `unsafe fn` over host memory
 fn new_framebuffer_buffer<P: Platform>(
     device: &P::Device,
@@ -674,7 +678,7 @@ fn new_framebuffer_buffer<P: Platform>(
     // which it releases only when presentation stops, after releasing the texture, the buffer's
     // only owner here. A display that retained the texture as its current frame can outlive the
     // mapping; that lifetime is kept.
-    let bytes = unsafe { crate::platform::HostRange::new(pointer, length) };
+    let bytes = unsafe { crate::platform::HostRange::new(pointer, length) }.unlogged();
     device.new_buffer_over_host_memory(OnFault::Die, bytes, 0, None)
 }
 

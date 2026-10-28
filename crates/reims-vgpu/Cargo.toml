@@ -28,6 +28,9 @@ reims-vgpu-vulkan = { workspace = true, optional = true }
 reims-vgpu-video-core.workspace = true
 # A window frame that fails, or a window that gets no sink (`window::vulkan`).
 log.workspace = true
+# KVM's dirty-log ioctls, in a host's dirty source's harvest (`dirty`); on Linux, the guest's RAM
+# as a host maps it, a shared mapping of a file (`platform::tests`).
+libc.workspace = true
 
 # The video device's backends on Linux (`video::backend_choice`): VA-API, on libva and libva-drm;
 # NVIDIA's NVDEC and NVENC, whose libraries it loads at run time.
@@ -49,10 +52,6 @@ objc2-quartz-core = { workspace = true, features = ["CAMetalLayer", "objc2-metal
 reims-vgpu-core = { workspace = true, features = ["testkit"] }
 # The scaler's conformance suite, which the scaler backend's tests run (`scaler::gpu`).
 reims-vgpu-video-conformance = { path = "../reims-vgpu-video-conformance" }
-
-# The guest's RAM as a host maps it on Linux, a shared mapping of a file (`platform::tests`).
-[target.'cfg(target_os = "linux")'.dev-dependencies]
-libc.workspace = true
 
 # A swapchain over a layer of the test's own on macOS, its surface made with ash's types
 # (`window::vulkan`'s tests).
