@@ -2187,6 +2187,42 @@ pub fn inexact(sel: &'static str, kind: Inexact, what: impl FnOnce() -> String) 
     }
 }
 
+/// How many times this process answered a call as when memory runs out ([`out_of_host_memory`]).
+static OUT_OF_HOST_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A map, a file or memory that this platform's host refused at `call` for want of mappings
+/// (`vm.max_map_count`), of open files or of memory, where Metal's call needs none: in strict
+/// mode the process ends there, naming `detail`, as it did before; by default the caller answers
+/// as Metal's call does when memory runs out (`KERN_NO_SPACE`, no memory, a nil object), and the
+/// answer is counted ([`out_of_host_memory_count`]) and logged at the first and at each power of
+/// two. `detail` is asked only for a line.
+pub(crate) fn out_of_host_memory(call: &'static str, detail: impl FnOnce() -> String) {
+    use std::sync::atomic::Ordering;
+    if strict() {
+        fatal_with_detail(
+            DeathId::Platform {
+                kind: DeathKind::Abort,
+                call,
+            },
+            &detail(),
+        );
+    }
+    let count = OUT_OF_HOST_MEMORY.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        log::warn!(
+            target: "reims_vgpu_vulkan::os",
+            "{count} calls answered as when memory runs out, the latest at {call}: {}; \
+             REIMS_VGPU_STRICT=1 makes each a death",
+            detail()
+        );
+    }
+}
+
+/// How many times this process answered a call as when memory runs out ([`out_of_host_memory`]).
+pub fn out_of_host_memory_count() -> u64 {
+    OUT_OF_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Each kind of [`Inexact`] this process relayed, with how many times.
 pub fn inexact_counts() -> Vec<(Inexact, u64)> {
     use std::sync::atomic::Ordering;

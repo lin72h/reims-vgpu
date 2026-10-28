@@ -710,16 +710,23 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
 - **Before anything would die or be refused at the whole budget**, the
   library folds back into dma-bufs the views' pages mapped from their files
   that no live import a device may pin holds, and weighs again (`vm.rs`,
-  "Folding back"). Only where that frees too little does a view die or an
-  import get refused. A map the kernel itself refuses at `vm.max_map_count`,
-  when the rest of the process holds more than the 16,384 kept for it, folds
-  the same way and is tried once more; only a second refusal ends the
-  process.
+  "Folding back"). Only where that frees too little is a view or an import
+  refused. A map the kernel itself refuses at `vm.max_map_count`, when the
+  rest of the process holds more than the 16,384 kept for it, folds the same
+  way and is tried once more.
+- **What is refused for want of mappings** answers as the same call does on
+  the Metal platform when memory runs out: a remap of guest pages, or a range
+  a view is made of, answers `KERN_NO_SPACE` with nothing mapped, an
+  IOSurface stand-in's memory is none, an import's twin is none, and a buffer
+  over a surface or a heap over address ranges is nil. Each is counted and
+  logged at the first and at each power of two. A replace whose alias is
+  refused still ends the process. With `REIMS_VGPU_STRICT=1` each ends the
+  process at the call, naming the numbers.
 - **Where `/dev/udmabuf` is not the process's** (the device node is the `kvm`
-  group's on Ubuntu), every view is mapped from its files, and a view past the
-  budget ends the process, naming the numbers. At the kernel's default that
-  is about 192 MiB of an x86-64 guest's views, so such a host needs udmabuf,
-  not a higher limit.
+  group's on Ubuntu), every view is mapped from its files, so views past the
+  budget are refused as above. At the kernel's default that is about 192 MiB
+  of an x86-64 guest's views, so such a host needs udmabuf, not a higher
+  limit.
 
 The budget is `vm.max_map_count` less 16,384 mappings kept for the rest of
 the process (QEMU, the C library, the driver, the runtime). On the same host,
@@ -732,6 +739,8 @@ line between them.
 What gets logged:
 - Where udmabuf is not the process's, a warning when the guest's RAM is
   leased, if the RAM at a mapping per 4 KiB page would not fit.
+- Each answer given for want of mappings, counted, at the first and at each
+  power of two.
 - On a device that needs pages mapped from their files, a warning if imports
   of all of the guest's RAM, a mapping per 4 KiB page, would pass the budget,
   with the `sysctl -w vm.max_map_count=...` value that covers them (2^23,

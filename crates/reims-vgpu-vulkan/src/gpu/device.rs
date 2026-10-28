@@ -647,7 +647,7 @@ impl VulkanDevice {
             let mut fresh = false;
             let made = || {
                 fresh = true;
-                backing::gather(sel, &allocation, length.saturating_add(offset), read_only)
+                backing::gather_or_nil(sel, &allocation, length.saturating_add(offset), read_only)
             };
             let alias = crate::os::surface_alias(surface, made);
             log::debug!(
@@ -1690,7 +1690,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 made_over = desc
                     .size
                     .checked_next_multiple_of(HEAP_GRANULE)
-                    .and_then(|size| backing::gather(sel, &ranges.ranges, size, read_only))
+                    .and_then(|size| backing::gather_or_nil(sel, &ranges.ranges, size, read_only))
                     .map(Arc::new);
                 match made_over
                     .as_ref()

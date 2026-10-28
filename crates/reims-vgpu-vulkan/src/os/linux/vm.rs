@@ -35,8 +35,11 @@
 //!
 //! **Mappings.** A run of a view mapped from its file is a VMA, so such a view of scattered pages
 //! costs one per run. The views share a budget short of `vm.max_map_count` ([`super::budget`]): a
-//! remap, a range a view can be made of or a stand-in's memory that would pass it ends the process
-//! before anything is mapped, so the rest of the process keeps its mappings.
+//! remap, a range a view can be made of or a stand-in's memory that would pass it is refused
+//! before anything is mapped, so the rest of the process keeps its mappings: a remap or a range
+//! answers `KERN_NO_SPACE` and a stand-in no memory, as Mach's and IOSurface's calls answer when
+//! memory runs out, which core answers as it does on the Metal platform then
+//! (`crate::answer::out_of_host_memory`, counted; in strict mode a death).
 //!
 //! **Views through dma-bufs.** An x86-64 macOS guest hands out its pages in 4 KiB pieces, each
 //! 16 KiB clump of them backwards (its free queue refills each CPU's list last in, first out), and
@@ -74,14 +77,14 @@
 //! the headroom, and only past the whole budget is handed over as mapped, which such a device
 //! refuses (`super::import`'s `no_room_to_unfold`).
 //!
-//! **Folding back.** At the views' budget, before anything would end the process or refuse an
-//! import that has no other way, the views' runs mapped from their files that no import a device
-//! may pin holds (`super::import`'s `Pinned`) are mapped through dma-bufs of their pages instead,
-//! a mapping per 4 MiB ([`fold_idle`]), where udmabuf is the process's. The same pages are
-//! mapped over them, so nothing reading or writing them sees a change; every change the library
-//! makes to its views' mappings (a view, an unfold, a protect, an overwrite, an unmap) holds the
-//! views' lock to read ([`views`]), and a fold holds it to write, so none of them runs while a
-//! fold maps, and a fold never maps over a range another changes.
+//! **Folding back.** At the views' budget, before anything is refused, the views' runs mapped
+//! from their files that no import a device may pin holds (`super::import`'s `Pinned`) are mapped
+//! through dma-bufs of their pages instead, a mapping per 4 MiB ([`fold_idle`]), where udmabuf is
+//! the process's. The same pages are mapped over them, so nothing reading or writing them sees a
+//! change; every change the library makes to its views' mappings (a view, an unfold, a protect,
+//! an overwrite, an unmap) holds the views' lock to read ([`views`]), and a fold holds it to
+//! write, so none of them runs while a fold maps, and a fold never maps over a range another
+//! changes.
 //!
 //! An import's pages are not mapped back through dma-bufs once the import goes: the guest's
 //! surfaces are imported again and again, the display's 32 MiB at 3840 × 2160 a frame, held about
@@ -92,19 +95,18 @@
 //!
 //! A map the kernel refuses for want of mappings, the process at `vm.max_map_count` (its other
 //! mappings past the reserve), first folds the views no import holds back into dma-bufs and runs
-//! the call again, the first try having changed nothing ([`reclaiming`]); refused again, it ends
-//! the process the same way, naming how many the process has and the limit ([`no_space`]): macOS
-//! has no such limit, so `KERN_NO_SPACE` there would be an answer Mach never gives. One refused
-//! for want of memory or address space is `KERN_NO_SPACE`, as Mach's is. A file the kernel gives
-//! none of for the library's memory ([`memfd`]) ends the process too, naming the open-file
-//! limit.
+//! the call again, the first try having changed nothing ([`reclaiming`]); refused again, it
+//! answers `KERN_NO_SPACE`, as a refusal for want of memory does, counted as the host's memory
+//! running out and naming how many mappings the process has and the limit ([`no_space`]; in
+//! strict mode a death). One refused for want of memory or address space is `KERN_NO_SPACE`, as
+//! Mach's is. A file the kernel gives none of for the library's memory ([`memfd`]) is refused as
+//! memory is, counted alike, naming the open-file limit.
 
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::Arc;
 
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use reims_vgpu_core::sync::{ReadGuard, WriterPrefRwLock};
 
 use super::budget;
@@ -210,9 +212,9 @@ thread_local! {
 
 /// `call`, which changes nothing where the kernel refuses one of its maps: where it refused one at
 /// the process's limit of mappings, the views no import holds folded back into dma-bufs
-/// ([`fold_idle`]) and `call` again, whose refusal at the limit then ends the process
-/// ([`no_space`]; module docs). Inside the views' lock, which a fold waits for, and inside
-/// another's first try, `call` once, the outer one trying again.
+/// ([`fold_idle`]) and `call` again, whose refusal at the limit then answers as the host's
+/// memory running out ([`no_space`]; module docs). Inside the views' lock, which a fold waits
+/// for, and inside another's first try, `call` once, the outer one trying again.
 pub(super) fn reclaiming<T>(mut call: impl FnMut() -> T) -> T {
     let armed = AT_LIMIT.with(std::cell::Cell::get).is_some();
     if armed || IN_VIEWS.with(std::cell::Cell::get) > 0 {
@@ -325,10 +327,11 @@ fn refused(what: &str, unmapped_is_enomem: bool) -> KernReturn {
 }
 
 /// `KERN_NO_SPACE` for a map the kernel refused for want of memory or address space, logged with
-/// the process's mappings and their limit (`vm.max_map_count`); one it refused for want of
-/// mappings, the process at the limit ([`at_the_limit`]), ends the process there, naming them
-/// (module docs), but inside [`reclaiming`]'s first try, which it answers `KERN_NO_SPACE` to try
-/// again once the views are folded.
+/// the process's mappings and their limit (`vm.max_map_count`). One it refused for want of
+/// mappings, the process at the limit ([`at_the_limit`]), is tried again once the views are
+/// folded where it is [`reclaiming`]'s first try; past that, it is the host's memory running out
+/// (`crate::answer::out_of_host_memory`), counted, its line naming the numbers, and in strict mode
+/// it ends the process there (module docs).
 fn no_space(what: &str) -> KernReturn {
     let (mappings, limit) = map_census();
     #[cfg(test)]
@@ -346,19 +349,16 @@ fn no_space(what: &str) -> KernReturn {
         return NO_SPACE;
     }
     if at_limit {
-        fatal_with_detail(
-            DeathId::Platform {
-                kind: DeathKind::Abort,
-                call: "mmap",
-            },
-            &format!(
+        crate::answer::out_of_host_memory("mmap", || {
+            format!(
                 "the process ran out of kernel mappings: the kernel refused {what} (ENOMEM) with \
                  {mappings} of vm.max_map_count {limit} held, {} of them the library's views of \
                  memory; macOS has no such limit, and `sysctl -w vm.max_map_count=` a higher \
                  value gives room",
                 budget::held()
-            ),
-        )
+            )
+        });
+        return NO_SPACE;
     }
     log::error!(
         target: "reims_vgpu_vulkan::os",
@@ -460,8 +460,10 @@ pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
         return Ok(HostAddr::NULL);
     }
     reclaiming(|| {
-        budget::admit(1, "a range a view can be made of");
-        let fd = memfd(length);
+        if !budget::admit(1, "a range a view can be made of") {
+            return Err(NO_SPACE);
+        }
+        let fd = memfd(length).map_err(|_| NO_SPACE)?;
         let backing = Backing { fd, offset: 0 };
         let prot = libc::PROT_READ | libc::PROT_WRITE;
         let at = file(None, length, &backing, prot)?;
@@ -482,16 +484,19 @@ pub(crate) struct OwnMemory {
 
 impl OwnMemory {
     /// `len` bytes, rounded up to whole pages, of zeros; `None` for none, or where the host
-    /// gives no file or no address space.
+    /// gives no file, no address space or no mapping within the views' budget, as an IOSurface's
+    /// creation answers nil when memory runs out.
     pub(crate) fn new(len: u64) -> Option<OwnMemory> {
         let (_, length) = pages(HostAddr::NULL, len)?;
         if length == 0 {
             return None;
         }
         let (first, backing) = reclaiming(|| {
-            budget::admit(1, "an IOSurface stand-in's memory");
+            if !budget::admit(1, "an IOSurface stand-in's memory") {
+                return None;
+            }
             let backing = Backing {
-                fd: memfd(length),
+                fd: memfd(length).ok()?,
                 offset: 0,
             };
             let first = file(None, length, &backing, libc::PROT_READ | libc::PROT_WRITE).ok()?;
@@ -523,37 +528,52 @@ impl Drop for OwnMemory {
 
 /// A new file of `length` bytes of zeros in memory (`memfd_create`), sealed against growing and
 /// shrinking, as `/dev/udmabuf` takes only a memfd sealed against shrinking
-/// ([`super::dma_buf`]). Where the kernel gives none, the process ends there, naming the error and
-/// the open-file limit (module docs).
-pub(crate) fn memfd(length: u64) -> Arc<OwnedFd> {
+/// ([`super::dma_buf`]). Where the kernel gives none, the kernel's error, the host's memory
+/// running out ([`no_file`]): the caller answers as when memory runs out (module docs).
+pub(crate) fn memfd(length: u64) -> Result<Arc<OwnedFd>, std::io::Error> {
+    #[cfg(test)]
+    if TEST_NO_FILE.with(std::cell::Cell::get) {
+        let error = std::io::Error::from_raw_os_error(libc::EMFILE);
+        return Err(no_file("memfd_create", length, error));
+    }
     let name = c"reims-vgpu";
     // SAFETY: a NUL-terminated name.
     let raw =
         unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING) };
     if raw < 0 {
-        no_file("memfd_create", length);
+        let error = std::io::Error::last_os_error();
+        return Err(no_file("memfd_create", length, error));
     }
     // SAFETY: a descriptor just made, owned from here on.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     let Ok(size) = libc::off_t::try_from(length) else {
-        no_file("ftruncate", length);
+        let error = std::io::Error::from_raw_os_error(libc::EFBIG);
+        return Err(no_file("ftruncate", length, error));
     };
     // SAFETY: an open memfd.
     if unsafe { libc::ftruncate(fd.as_raw_fd(), size) } != 0 {
-        no_file("ftruncate", length);
+        let error = std::io::Error::last_os_error();
+        return Err(no_file("ftruncate", length, error));
     }
     let seals = libc::F_SEAL_GROW | libc::F_SEAL_SHRINK;
     // SAFETY: an open memfd made to take seals.
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_ADD_SEALS, seals) } != 0 {
-        no_file("fcntl(F_ADD_SEALS)", length);
+        let error = std::io::Error::last_os_error();
+        return Err(no_file("fcntl(F_ADD_SEALS)", length, error));
     }
-    Arc::new(fd)
+    Ok(Arc::new(fd))
 }
 
-/// The death at `call` of a file of `length` bytes the kernel gave none of ([`memfd`]), with the
-/// error just set and the open-file limit.
-fn no_file(call: &'static str, length: u64) -> ! {
-    let error = std::io::Error::last_os_error();
+#[cfg(test)]
+thread_local! {
+    /// A test's kernel that gives no file, on the thread that sets it ([`memfd`]).
+    pub(crate) static TEST_NO_FILE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `error`, the kernel's refusal at `call` of a file of `length` bytes ([`memfd`]), the host's
+/// memory running out (`crate::answer::out_of_host_memory`): counted, its line naming the error
+/// and the open-file limit, and in strict mode the process ends at `call`.
+fn no_file(call: &'static str, length: u64, error: std::io::Error) -> std::io::Error {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -565,16 +585,13 @@ fn no_file(call: &'static str, length: u64) -> ! {
     } else {
         "?".to_owned()
     };
-    fatal_with_detail(
-        DeathId::Platform {
-            kind: DeathKind::Abort,
-            call,
-        },
-        &format!(
+    crate::answer::out_of_host_memory(call, || {
+        format!(
             "the kernel gave no file of {length:#x} bytes for the library's memory ({error}); \
              the open-file limit is {limit}; IOSurface's and Mach's calls need no file on macOS"
-        ),
-    )
+        )
+    });
+    error
 }
 
 /// Maps `length` bytes from `at`, a piece of a remap that failed after mapping it, back to what
@@ -662,8 +679,10 @@ fn map_view(target: u64, pieces: Vec<files::Piece>) -> Result<(), KernReturn> {
             Err(refusal) => no_dma_bufs(&refusal),
         }
     }
-    if claim.is_none() {
-        budget::admit(adding, "a view of guest pages");
+    // Past the budget, `KERN_NO_SPACE`, nothing mapped, as Mach's remap answers when memory runs
+    // out (module docs).
+    if claim.is_none() && !budget::admit(adding, "a view of guest pages") {
+        return Err(NO_SPACE);
     }
     let _views = views();
     for (done, piece) in pieces.iter().enumerate() {
@@ -715,7 +734,9 @@ fn map_through(
     pieces: Vec<files::Piece>,
     bufs: Vec<super::dma_buf::ViewBuf>,
 ) -> Result<(), KernReturn> {
-    budget::admit(bufs.len().to_u64() + 2, "a view of guest pages");
+    if !budget::admit(bufs.len().to_u64() + 2, "a view of guest pages") {
+        return Err(NO_SPACE);
+    }
     let _views = views();
     through(target, pieces, bufs, true)
 }
@@ -1121,6 +1142,8 @@ impl HostVm for LinuxVm {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use reims_vgpu_core::raise::death::DeathKind;
+
     use super::*;
 
     fn vm() -> LinuxVm {
@@ -1355,7 +1378,7 @@ pub(crate) mod tests {
 
     /// A map the kernel refuses at the process's limit of mappings folds the views no import
     /// holds and is made again, the first try having changed nothing; refused again, or outside
-    /// a call that can try again, it ends the process
+    /// a call that can try again, it ends the process in strict mode
     #[test]
     fn a_map_refused_at_the_limit_folds_the_views_and_tries_again() {
         use reims_vgpu_core::testkit::capture::catch_death;
@@ -1400,6 +1423,42 @@ pub(crate) mod tests {
         for a in [at, src] {
             assert!(v.deallocate(a, n * p).is_success());
         }
+    }
+
+    /// A map refused at the process's limit of mappings outside a call that can try again
+    /// answers `KERN_NO_SPACE` by default, counted, as Mach's does when memory runs out
+    #[test]
+    fn a_map_refused_at_the_limit_answers_no_space_by_default() {
+        let before = crate::answer::out_of_host_memory_count();
+        TEST_AT_LIMIT.with(|t| t.set(true));
+        let answer = crate::answer::relaxed(|| no_space("a test's map"));
+        TEST_AT_LIMIT.with(|t| t.set(false));
+        assert_eq!(answer, NO_SPACE);
+        assert_eq!(crate::answer::out_of_host_memory_count(), before + 1);
+    }
+
+    /// Where the kernel gives no file, a range a view can be made of answers `KERN_NO_SPACE` and
+    /// a stand-in's memory none, as Mach's and IOSurface's calls do when memory runs out,
+    /// counted; in strict mode the process ends at the call that made no file
+    #[test]
+    fn no_file_answers_as_memory_runs_out() {
+        use reims_vgpu_core::testkit::capture::catch_death;
+        let p = page();
+        TEST_NO_FILE.with(|t| t.set(true));
+        let site = catch_death(|| allocate_aliasable(p));
+        assert_eq!(
+            site.map_err(|site| (site.kind, site.file)),
+            Err((DeathKind::Abort, "memfd_create"))
+        );
+        let before = crate::answer::out_of_host_memory_count();
+        let (range, stand_in) =
+            crate::answer::relaxed(|| (allocate_aliasable(p), OwnMemory::new(p)));
+        TEST_NO_FILE.with(|t| t.set(false));
+        assert_eq!(range, Err(NO_SPACE));
+        assert!(stand_in.is_none());
+        assert_eq!(crate::answer::out_of_host_memory_count(), before + 2);
+        let at = allocate_aliasable(p).unwrap();
+        assert!(vm().deallocate(at, p).is_success());
     }
 
     /// The host page is 4 KiB on x86-64 Linux, its shift 12
@@ -1541,7 +1600,7 @@ pub(crate) mod tests {
     /// A file of one page whose bytes are `byte`, its descriptor read-only (opened again through
     /// `/proc/self/fd`) when `read_only`, so a shared writable map of it is refused (`EACCES`).
     fn page_file(byte: u8, read_only: bool) -> Arc<OwnedFd> {
-        let fd = memfd(page());
+        let fd = memfd(page()).unwrap();
         let at = file(
             None,
             page(),
@@ -1663,7 +1722,7 @@ pub(crate) mod tests {
             v.deallocate(HostAddr::from_addr(usize::MAX & !0xfff), 2 * page()),
             INVALID_ARGUMENT
         );
-        let fd = memfd(page());
+        let fd = memfd(page()).unwrap();
         let at = file(
             None,
             page(),

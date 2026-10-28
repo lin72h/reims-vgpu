@@ -57,7 +57,7 @@ fn harvest(log: &DirtyLog, written: &[Range<u64>]) -> DirtyStamp {
 /// table only records them) and in the file, apart in the guest: guest 0..1 MiB at `base`, and
 /// guest 4 GiB on at `base + 1 MiB`, from file offset 1 MiB.
 fn ram(base: u64, log: Option<Arc<DirtyLog>>) -> super::super::GuestMemoryLease {
-    let f = memfd(0x20_0000);
+    let f = memfd(0x20_0000).unwrap();
     let range = |host, guest, offset| GuestRamFile {
         host,
         guest,

@@ -104,6 +104,9 @@ pub(crate) enum Refusal {
     /// The kernel refused the call otherwise (a file it takes no pages of, unsealed or not a
     /// memfd, or no memory to pin the pages).
     Kernel(io::Error),
+    /// The kernel gave no file for zeros the range takes, a pad's or the block of zeros' pieces
+    /// ([`vm::memfd`], which counts it as the host's memory running out).
+    NoFile(io::Error),
     /// A view would write through a dma-buf of a file the process holds open read-only, whose
     /// pages the kernel maps writable from the file for no one ([`of_view`]).
     ReadOnlyFile,
@@ -136,6 +139,7 @@ impl fmt::Display for Refusal {
                 )
             }
             Refusal::Kernel(e) => write!(f, "UDMABUF_CREATE_LIST failed: {e}"),
+            Refusal::NoFile(e) => write!(f, "the kernel gave no file for zeros of the range: {e}"),
             Refusal::ReadOnlyFile => write!(f, "a writable view of a file open read-only"),
         }
     }
@@ -248,12 +252,13 @@ fn chunks<F: Clone>(runs: &[Run<F>], granule: u64, limits: Limits) -> Option<Vec
 /// [`chunks`] of `runs`, padded where they are more than one: then they come to the window's
 /// length rounded up to `granule`, as the runtime binds each chunk at a multiple of it, and the
 /// last ends with a run `pad` makes of the bytes past the window, a file of the import's own, so a
-/// GPU write past the window's end reaches nothing else.
+/// GPU write past the window's end reaches nothing else. `None` where they fit no chunks, or
+/// `pad` makes none.
 fn padded<F: Clone>(
     runs: &mut Vec<Run<F>>,
     granule: u64,
     limits: Limits,
-    pad: impl FnOnce(u64) -> Run<F>,
+    pad: impl FnOnce(u64) -> Option<Run<F>>,
 ) -> Option<Vec<Vec<Run<F>>>> {
     let cut = chunks(runs, granule, limits)?;
     let length: u64 = runs.iter().map(|r| r.length).sum();
@@ -261,7 +266,7 @@ fn padded<F: Clone>(
     if cut.len() == 1 || past == 0 {
         return Some(cut);
     }
-    runs.push(pad(past));
+    runs.push(pad(past)?);
     chunks(runs, granule, limits)
 }
 
@@ -275,8 +280,8 @@ pub(crate) struct Zeros(Mutex<BTreeMap<u64, (u64, Arc<OwnedFd>)>>);
 impl Zeros {
     /// The pieces of its files that answer the `length` bytes of the block of zeros at `at`, in
     /// order, each with its length: those its files hold already, and a new file for each run of
-    /// the rest.
-    fn pieces(&self, at: u64, length: u64) -> Vec<(Backing, u64)> {
+    /// the rest; the kernel's refusal where it gives no file for one ([`vm::memfd`]).
+    fn pieces(&self, at: u64, length: u64) -> Result<Vec<(Backing, u64)>, Refusal> {
         let end = at.saturating_add(length);
         let mut files = self.0.lock();
         let held: Vec<(u64, u64, Arc<OwnedFd>)> = (files.range(..end))
@@ -284,15 +289,15 @@ impl Zeros {
             .map(|(&first, (bytes, fd))| (first, *bytes, Arc::clone(fd)))
             .collect();
         let made = |files: &mut BTreeMap<u64, (u64, Arc<OwnedFd>)>, first: u64, bytes: u64| {
-            let fd = vm::memfd(bytes);
+            let fd = vm::memfd(bytes).map_err(Refusal::NoFile)?;
             files.insert(first, (bytes, Arc::clone(&fd)));
-            (Backing { fd, offset: 0 }, bytes)
+            Ok::<_, Refusal>((Backing { fd, offset: 0 }, bytes))
         };
         let mut pieces = Vec::new();
         let mut next = at;
         for (first, bytes, fd) in held {
             if first > next {
-                pieces.push(made(&mut files, next, first - next));
+                pieces.push(made(&mut files, next, first - next)?);
             }
             let from = first.max(next);
             let to = first.saturating_add(bytes).min(end);
@@ -301,9 +306,9 @@ impl Zeros {
             next = to;
         }
         if next < end {
-            pieces.push(made(&mut files, next, end - next));
+            pieces.push(made(&mut files, next, end - next)?);
         }
-        pieces
+        Ok(pieces)
     }
 }
 
@@ -323,7 +328,7 @@ fn add_runs(
     let of_zeros = super::import::of_zeros(&resolved);
     for (piece, of_zeros) in resolved.into_iter().zip(of_zeros) {
         let backings = if of_zeros {
-            zeros.pieces(first + piece.at, piece.length)
+            zeros.pieces(first + piece.at, piece.length)?
         } else {
             vec![(piece.backing, piece.length)]
         };
@@ -389,12 +394,24 @@ pub(crate) fn of_pages(
         granule,
         limits,
     };
-    let pad = |pad| Run {
-        file: vm::memfd(pad),
-        offset: 0,
-        length: pad,
+    // The kernel's refusal of the pad's file, where it gave none ([`vm::memfd`]).
+    let no_file = std::cell::Cell::new(None);
+    let pad = |pad| match vm::memfd(pad) {
+        Ok(file) => Some(Run {
+            file,
+            offset: 0,
+            length: pad,
+        }),
+        Err(e) => {
+            no_file.set(Some(e));
+            None
+        }
     };
-    let cut = padded(&mut runs, granule, limits, pad).ok_or_else(|| refused(&runs))?;
+    let cut = padded(&mut runs, granule, limits, pad).ok_or_else(|| {
+        no_file
+            .take()
+            .map_or_else(|| refused(&runs), Refusal::NoFile)
+    })?;
     let made = cut.iter().map(|chunk| {
         let fd = create(device, chunk)?;
         Ok(DmaBufChunk {
@@ -570,24 +587,37 @@ mod tests {
         let shape = |pieces: &[(Backing, u64)]| -> Vec<(u64, u64)> {
             pieces.iter().map(|(b, n)| (b.offset, *n)).collect()
         };
-        let middle = zeros.pieces(0x3000, 0x2000);
+        let middle = zeros.pieces(0x3000, 0x2000).unwrap();
         assert_eq!(shape(&middle), [(0, 0x2000)]);
-        let inside = zeros.pieces(0x4000, 0x1000);
+        let inside = zeros.pieces(0x4000, 0x1000).unwrap();
         assert_eq!(shape(&inside), [(0x1000, 0x1000)]);
         assert!(Arc::ptr_eq(&inside[0].0.fd, &middle[0].0.fd));
         // Pages on both sides, asked for the first time, take files of their own around it.
-        let around = zeros.pieces(0x1000, 0x6000);
+        let around = zeros.pieces(0x1000, 0x6000).unwrap();
         assert_eq!(shape(&around), [(0, 0x2000), (0, 0x2000), (0, 0x2000)]);
         assert!(Arc::ptr_eq(&around[1].0.fd, &middle[0].0.fd));
         assert!(!Arc::ptr_eq(&around[0].0.fd, &around[2].0.fd));
-        let again = zeros.pieces(0x2000, 0x4000);
+        let again = zeros.pieces(0x2000, 0x4000).unwrap();
         assert_eq!(shape(&again), [(0x1000, 0x1000), (0, 0x2000), (0, 0x1000)]);
         for (a, b) in again.iter().zip(&around) {
             assert!(Arc::ptr_eq(&a.0.fd, &b.0.fd));
         }
         // Another import's source answers files of its own.
-        let other = Zeros::default().pieces(0x3000, 0x2000);
+        let other = Zeros::default().pieces(0x3000, 0x2000).unwrap();
         assert!(!Arc::ptr_eq(&other[0].0.fd, &middle[0].0.fd));
+    }
+
+    /// Where the kernel gives no file for zeros, the request is refused (`Refusal::NoFile`),
+    /// counted by default and keeping nothing; the pages asked for again take a file then
+    #[test]
+    fn zero_pages_the_kernel_gives_no_file_for_are_refused() {
+        let zeros = Zeros::default();
+        vm::TEST_NO_FILE.with(|no| no.set(true));
+        let refused = crate::answer::relaxed(|| zeros.pieces(0x3000, 0x2000));
+        vm::TEST_NO_FILE.with(|no| no.set(false));
+        assert!(matches!(refused, Err(Refusal::NoFile(_))), "{refused:?}");
+        assert!(zeros.0.lock().is_empty(), "nothing kept");
+        assert_eq!(zeros.pieces(0x3000, 0x2000).unwrap().len(), 1);
     }
 
     /// Every request of an import's source over the same pages of the block of zeros answers the
@@ -720,7 +750,7 @@ mod tests {
             pieces: 2,
             bytes: 0x10000,
         };
-        let pad = |length| run(99, 0, length);
+        let pad = |length| Some(run(99, 0, length));
         let mut one = vec![run(1, 0, 0x1000)];
         assert_eq!(
             padded(&mut one, 0x4000, limits, pad),

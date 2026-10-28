@@ -184,7 +184,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::num::NonZeroU64;
 use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
@@ -1433,11 +1433,12 @@ fn off_the_page(sel: &'static str, address: u64, into: u64) -> ! {
 /// unmapped range, one with a page the host maps without read access, which the runtime refuses
 /// to import, past `size` too). Where the host refuses the alias what it needs past those checks
 /// (address space, a remap of the guest's pages, which on Linux takes pages with a file behind
-/// them, a protection), the process ends at `sel` ([`refused_by_host`]): Metal takes the ranges.
+/// them, the block of zeros, a protection), the process ends at `sel` ([`refused_by_host`]):
+/// Metal takes the ranges. [`gather_or_nil`] answers nil there instead.
 ///
 /// Where the runtime imports read-only memory through a writable twin of its files
 /// ([`crate::os::TWINS_READ_ONLY`], Linux), a read-only alias's zeros past the ranges' pages map
-/// the block of zeros ([`fill_zeros`]), as a twin can be made of a file alone: the twin's are
+/// the block of zeros ([`map_zeros`]), as a twin can be made of a file alone: the twin's are
 /// zeros of its own then ([`crate::os::import_view`]). Elsewhere they are the fresh range's own,
 /// which a writable alias with zeros past its ranges' pages takes from
 /// [`crate::os::allocate_aliasable`]: on Linux a file of its own, as the runtime imports a range
@@ -1450,19 +1451,70 @@ pub(crate) fn gather(
     size: u64,
     read_only: bool,
 ) -> Option<Alias> {
+    gather_short(sel, ranges, size, read_only).unwrap_or_else(|short| refused_by_host(sel, &short))
+}
+
+/// [`gather`] for a call whose refusal is a nil object (a buffer over a surface, a heap over
+/// address ranges): where the host refuses the alias what it needs, the call answers nil, as
+/// Metal's does when memory runs out, nothing left mapped
+/// (`crate::answer::out_of_host_memory`, counted; in strict mode the process ends at `sel`).
+pub(crate) fn gather_or_nil(
+    sel: &'static str,
+    ranges: &[ResourceAddressRange],
+    size: u64,
+    read_only: bool,
+) -> Option<Alias> {
+    gather_short(sel, ranges, size, read_only).unwrap_or_else(|short| {
+        crate::answer::out_of_host_memory(sel, || short.0);
+        None
+    })
+}
+
+/// What the host refused [`gather`]'s alias past the checks of its ranges, where Metal's call
+/// goes on: the line that names it.
+#[derive(Debug)]
+struct HostShort(String);
+
+impl HostShort {
+    /// The host's refusal of `what`, of `length` bytes, with `kr`.
+    fn of(what: &str, length: u64, kr: KernReturn) -> HostShort {
+        HostShort(format!(
+            "the host refused {what} of {length:#x} bytes (kern_return {}), where Metal's call \
+             goes on",
+            kr.0
+        ))
+    }
+}
+
+/// [`gather`], `Err` where the host refuses the alias what it needs, nothing left mapped.
+fn gather_short(
+    sel: &'static str,
+    ranges: &[ResourceAddressRange],
+    size: u64,
+    read_only: bool,
+) -> Result<Option<Alias>, HostShort> {
     let vm = OsVm::new();
     let page = vm.page_size();
-    let length = size.checked_next_multiple_of(page)?;
+    let Some(length) = size.checked_next_multiple_of(page) else {
+        return Ok(None);
+    };
     // Every page of the ranges, those past `size` too, as Metal refuses one there (measured);
     // checked before the alias takes address space, which a hole among the ranges could hold,
-    // and before a death of ranges Metal refuses.
-    for span in spans(ranges, page)? {
-        let source = HostPtr::from_addr(usize::try_from(span.start).ok()?);
-        if !vm.readable(source, span.end - span.start) {
-            return None;
+    // and before a refusal of the host's.
+    let Some(spans) = spans(ranges, page) else {
+        return Ok(None);
+    };
+    for span in spans {
+        let Ok(start) = usize::try_from(span.start) else {
+            return Ok(None);
+        };
+        if !vm.readable(HostPtr::from_addr(start), span.end - span.start) {
+            return Ok(None);
         }
     }
-    let runs = runs(sel, ranges, length, page)?;
+    let Some(runs) = runs(sel, ranges, length, page) else {
+        return Ok(None);
+    };
     // The ranges' pages fill the alias from its start; zeros follow them.
     let pages = runs.last().map_or(0, |run| run.offset + run.length);
     let zero_block = read_only && crate::os::TWINS_READ_ONLY;
@@ -1471,51 +1523,48 @@ pub(crate) fn gather(
     } else {
         vm.allocate_anywhere(length)
     }
-    .unwrap_or_else(|kr| refused_by_host(sel, "address space for an alias", length, kr));
-    let alias = Alias::own(NonNull::new(at.as_ptr::<u8>())?, length);
+    .map_err(|kr| HostShort::of("address space for an alias", length, kr))?;
+    let Some(first) = NonNull::new(at.as_ptr::<u8>()) else {
+        return Ok(None);
+    };
+    // Unmapped as it drops, so nothing is left mapped where the host refuses the rest.
+    let alias = Alias::own(first, length);
     // The runs follow on from the alias's start ([`runs`]), so they are one view, made at once:
     // on Linux through dma-bufs of the pages where the host makes them (`crate::os`'s VM).
     let mut sources = Vec::with_capacity(runs.len());
     for run in &runs {
-        sources.push((
-            HostPtr::from_addr(usize::try_from(run.source).ok()?),
-            run.length,
-        ));
+        let Ok(source) = usize::try_from(run.source) else {
+            return Ok(None);
+        };
+        sources.push((HostPtr::from_addr(source), run.length));
     }
     if let Err((i, kr)) = vm.remap_runs_shared_overwrite(at, &sources) {
-        refused_by_host(
-            sel,
-            "a remap of the guest's pages into an alias",
-            runs[i].length,
-            kr,
-        );
+        let what = "a remap of the guest's pages into an alias";
+        return Err(HostShort::of(what, runs[i].length, kr));
     }
     if read_only {
         if zero_block {
-            fill_zeros(sel, &vm, at, pages, length);
+            map_zeros(&vm, at, pages, length)
+                .map_err(|ZerosRefused { what, length, kr }| HostShort::of(what, length, kr))?;
         }
         if let Err(kr) = vm.protect_max(at, length, VmProt::READ) {
-            refused_by_host(sel, "an alias's read-only protection", length, kr);
+            return Err(HostShort::of("an alias's read-only protection", length, kr));
         }
     }
-    Some(alias)
+    Ok(Some(alias))
 }
 
-/// The death at `sel` of `what`, of `length` bytes, that the host refused with `kr`, where
-/// Metal's call goes on: this platform's alias of the guest's pages, or its zeros, need what
-/// Metal's own call does not, and no answer of Metal's fits without them (a NO or nil where
-/// Metal answers YES, or a detach whose object stays over the guest's pages).
-fn refused_by_host(sel: &'static str, what: &str, length: u64, kr: KernReturn) -> ! {
+/// The death at `sel` of what the host refused ([`HostShort`]), where Metal's call goes on: this
+/// platform's alias of the guest's pages, or its zeros, need what Metal's own call does not, and
+/// no answer of Metal's fits without them (a NO where Metal answers YES, or a detach whose object
+/// stays over the guest's pages).
+fn refused_by_host(sel: &'static str, short: &HostShort) -> ! {
     fatal_with_detail(
         DeathId::Platform {
             kind: DeathKind::Abort,
             call: sel,
         },
-        &format!(
-            "the host refused {what} of {length:#x} bytes (kern_return {}), where Metal's call \
-             goes on",
-            kr.0
-        ),
+        &short.0,
     )
 }
 
@@ -1558,31 +1607,23 @@ const ZERO_BLOCK: u64 = 0x10_0000;
 
 /// A block of [`ZERO_BLOCK`] bytes of zeros, read-only, made once and never freed, that a
 /// read-only alias's zeros past its ranges' pages map where the runtime twins read-only memory
-/// ([`fill_zeros`]); `Err` with the host's answer where it gave none. A view can be made of it
+/// ([`map_zeros`]); `Err` with the host's answer where it gave none, which a later call asks
+/// again, as the host may have room by then. A view can be made of it
 /// ([`crate::os::allocate_aliasable`]).
 fn zero_block() -> Result<HostPtr, KernReturn> {
-    static BLOCK: OnceLock<Result<usize, KernReturn>> = OnceLock::new();
-    let at = BLOCK.get_or_init(|| {
-        let vm = OsVm::new();
-        let at = crate::os::allocate_zeros(ZERO_BLOCK)?;
-        match vm.protect_max(at, ZERO_BLOCK, VmProt::READ) {
-            Ok(()) => Ok(at.addr()),
-            Err(kr) => {
-                let _ = vm.deallocate(at, ZERO_BLOCK);
-                Err(kr)
-            }
-        }
-    });
-    at.map(HostPtr::from_addr)
-}
-
-/// Maps the block of [`zero_block`] over the bytes from `from` to `length` of the range at `at`,
-/// whole pages ([`map_zeros`]). Where the host gave no block or refused a remap, the process ends
-/// at `sel` ([`refused_by_host`]).
-fn fill_zeros(sel: &'static str, vm: &OsVm, at: HostPtr, from: u64, length: u64) {
-    if let Err(ZerosRefused { what, length, kr }) = map_zeros(vm, at, from, length) {
-        refused_by_host(sel, what, length, kr);
+    static BLOCK: Mutex<Option<usize>> = Mutex::new(None);
+    let mut block = BLOCK.lock();
+    if let Some(at) = *block {
+        return Ok(HostPtr::from_addr(at));
     }
+    let vm = OsVm::new();
+    let at = crate::os::allocate_zeros(ZERO_BLOCK)?;
+    if let Err(kr) = vm.protect_max(at, ZERO_BLOCK, VmProt::READ) {
+        let _ = vm.deallocate(at, ZERO_BLOCK);
+        return Err(kr);
+    }
+    *block = Some(at.addr());
+    Ok(at)
 }
 
 /// What the host refused [`map_zeros`]: what, of how many bytes, and its answer.

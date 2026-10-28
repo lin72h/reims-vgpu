@@ -576,11 +576,16 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
 
 /// A writable twin of the `length` bytes from `first` that `pieces` show: each piece's file
 /// pages, shared, read and write, but zeros', which stay the fresh reservation's own private
-/// zeros; `None` where the host maps none.
+/// zeros; `None` where the host maps none, or the views' budget has no room for it
+/// ([`budget::admit`]).
 fn twin(first: u64, length: u64, pieces: &[files::Piece]) -> Option<Twin> {
     let zeros = of_zeros(pieces);
     let mappings = twin_mappings(pieces, &zeros);
-    budget::admit(mappings, "an import's twin");
+    // Past the budget no twin, counted: the runtime refuses the read-only pages as it refuses
+    // any import of them.
+    if !budget::admit(mappings, "an import's twin") {
+        return None;
+    }
     let base = vm::anonymous(None, length, "an import's twin").ok()?;
     let mut twin = Twin {
         first: base,
@@ -713,7 +718,7 @@ mod tests {
     /// one file or neighbouring pieces of zeros, and the kernel maps it so
     #[test]
     fn a_twin_counts_its_mappings_as_the_kernel_maps_them() {
-        let f = vm::memfd(4 * PAGE);
+        let f = vm::memfd(4 * PAGE).unwrap();
         let zero_at = allocate_zeros(PAGE).unwrap();
         let z = files::pieces(zero_at.addr().to_u64(), 1).unwrap()[0]
             .backing
@@ -811,9 +816,10 @@ mod tests {
     }
 
     /// Readable pages with no file behind them, which no view is made of, end the process at the
-    /// call that gathers them into an alias, where Metal takes them
+    /// call that gathers them into an alias, where Metal takes them; a call whose refusal is nil
+    /// answers nil there by default, counted, as when memory runs out, and dies in strict mode
     #[test]
-    fn a_gather_of_pages_without_a_file_dies() {
+    fn a_gather_of_pages_without_a_file_is_the_hosts_refusal() {
         use reims_vgpu_core::platform::types::ResourceAddressRange;
         use reims_vgpu_core::raise::death::DeathKind;
         use reims_vgpu_core::testkit::capture::catch_death;
@@ -827,6 +833,12 @@ mod tests {
         let gathered = || crate::gpu::backing::gather("test", &ranges, PAGE, false).is_some();
         let site = catch_death(gathered).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, "test"));
+        let or_nil = || crate::gpu::backing::gather_or_nil("test", &ranges, PAGE, false).is_some();
+        let site = catch_death(or_nil).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, "test"), "strict");
+        let before = crate::answer::out_of_host_memory_count();
+        assert!(!crate::answer::relaxed(or_nil), "nil");
+        assert_eq!(crate::answer::out_of_host_memory_count(), before + 1);
         assert!(vm.deallocate(at, PAGE).is_success());
     }
 
@@ -888,11 +900,7 @@ mod tests {
             assert!(dies(|| import_view(p, n * PAGE)), "strict");
             let (handed, handed_bytes) = counted(&HANDED_OVER);
             let import = crate::answer::relaxed(|| import_view(p, n * PAGE));
-            assert_eq!(
-                (import.at(), mappings()),
-                (p, 1),
-                "handed over as mapped"
-            );
+            assert_eq!((import.at(), mappings()), (p, 1), "handed over as mapped");
             assert_eq!(counted(&HANDED_OVER), (handed + 1, handed_bytes + n * PAGE));
             budget::set_test_limit(Some(limit(budget::HEADROOM + 8)));
             let import = import_view(p, n * PAGE);
