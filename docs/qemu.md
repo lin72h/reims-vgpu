@@ -102,6 +102,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | smooth scrolling: the input layer's `scroll` events (`qemu_input_queue_scroll`, `qemu_input_scrolls_smoothly`, QMP `input-send-event`); `usb-vmapple-tablet`, Virtualization.framework's USB pointing device, which a macOS guest scrolls as a trackpad; `vmapple`'s `tablet` property, `usb-vmapple-tablet` by default; the windows' scroll callback sent as smooth scroll events, or as notches to a device without them ("Measured facts about driving it", below) | `840feb5ced`, `c2f5832f32`, `674af72fe2`, `3dd8c62445`, `da640879f0`, `e0ce93da92`, `d46ebaa252`, `61f7de5fc1`, `fc46f8bf02`, `797c366c0f` |
 | vmapple boots macOS 14 and later guests, with no option: when iBoot enters the kernel, which the machine sees through `hvf_arm_exec_fault`, a hook HVF calls on an instruction fetch's stage 2 fault, it takes the kernel's waits on failed pointer authentication hypercalls out of its code, and adds `/filesystems` with `DoNotUseSEP` to a device tree that has no `/filesystems` ("macOS 14 and later guests", below); `vmapple.rst`'s "Guest versions" | `a24c8eadfa`, `e1c37ea4d4` |
 | `apple-gfx` names each display "Reims vGPU" to the guest, which saw "QEMU display" before | `3ca83dca38` |
+| file-backed guest RAM (the memfd of `reims-ctl`'s VMs) mapped 2 MiB-aligned on Linux, as anonymous RAM is, so transparent huge pages can back it where the host allows them ("Linux hosts: huge pages for guest RAM", below) | `1b41f5f5db` |
 | `apple-gfx` builds on Linux hosts, for KVM: each range of the device's memory map has its own host address (q35's RAM above 4 GiB is an alias partway into its block) and names the file behind it, which the realize requires on Linux; the trace lists each range, and configure's summary says whether it found reims-vgpu ("apple-gfx on reims-vgpu", below). Its MMIO accesses call the library on the vCPU's thread, with no hop to the device's pool, and the GPU device's region takes them without the BQL under KVM ("MMIO", below). It reads each frame's pixels on the pool thread, and renders the console's surface only while a display change listener shows it, or when the display system asks ("Frames", below). It holds a user-initiated activity from its realize to its finalize, so App Nap never slows a VM whose window is hidden or behind another application's (`hw/display/apple-gfx-activity.m`; "App Nap", below) | `a771139e82` |
 | the library's repository name in `vmapple.rst` and `meson.build` | `f16664ed10` |
 | `apple-gfx-pci`'s BAR 2, a window onto the EFI framebuffer: one alias of the machine's RAM, moved as the guest writes the framebuffer's start, so that a macOS installer or recovery image, which has no driver of the device's own, takes the boot framebuffer over (the `efi-framebuffer-bar` property, on by default; "BAR 2" in "apple-gfx on reims-vgpu", and "x86-64 macOS guests: installers and recovery", below) | `1a72df9849` |
@@ -657,6 +658,24 @@ against the library and runtime before it:
 At 1680x1050 the copies do not bound the drag, and the source turns into
 headroom; at 3840x2160 they do. The same build with the source off moves
 what the build before it moved.
+
+### Linux hosts: huge pages for guest RAM
+
+QEMU maps file-backed guest RAM, the memfd of `reims-ctl`'s VMs among it, at
+a 2 MiB-aligned address (`system/physmem.c`), as it maps anonymous RAM.
+The kernel backs a shmem mapping with a transparent huge page only where the
+mapping's address keeps the file's offset in one, so at the 4 KiB alignment
+before, the guest ran on 4 KiB pages alone. Whether huge pages back it now
+is the host's choice: `/sys/kernel/mm/transparent_hugepage/shmem_enabled`
+at `advise` (CachyOS ships it), with QEMU's `MADV_HUGEPAGE`, or at `always`
+or `within_size`; at `never` or `deny`, upstream's default, nothing changes.
+KVM maps a slot under the dirty log 4 KiB at a time, so where the dirty
+source runs (above) the guest keeps its huge pages only until the first
+harvest.
+
+Measured on msi-5080 (macos-26, 16 GiB, a drag and a UFO test, no dirty
+source, 2026-10-27): KVM maps about 10 GiB of the guest at 2 MiB, none
+before, and the vCPUs' time a frame falls 6-7% at the same frame rate.
 
 ### Linux hosts: `vm.max_map_count`
 
