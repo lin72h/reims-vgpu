@@ -1146,10 +1146,12 @@ pub fn create<T>(
 ///   (`crate::os`'s import), whose writes die where they are encoded, so no call here reaches it;
 /// - `CopiedHostPages`: a no-copy buffer, heap or rebind made over a copy of the guest's pages in
 ///   memory of the device's own, as their import failed (out of memory, or a driver out of the
-///   mappings the host's kernel allows), which each commit fills from the pages and each
-///   completion writes back: a CPU write the GPU reads mid-command-buffer, or a GPU write the CPU
-///   reads before the batch completes, is not seen, where Metal's GPU uses the pages themselves.
-///   Announced inside the call that makes it, which dies at its selector.
+///   mappings the host's kernel allows), or the views' gate refused it on Linux, where mapping the
+///   pages from their files would have run the views of memory within the headroom of their
+///   budget of kernel mappings (`crate::os`'s import gate), which each commit fills from the
+///   pages and each completion writes back: a CPU write the GPU reads mid-command-buffer, or a GPU
+///   write the CPU reads before the batch completes, is not seen, where Metal's GPU uses the pages
+///   themselves. Announced inside the call that makes it, which dies at its selector.
 ///
 /// Every kind not listed here or in [`HEARD`] is relayed, those the guest sees included, each for
 /// one of the reasons the module's docs give: logged once per device and not dying. Each relayed

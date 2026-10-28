@@ -20,9 +20,12 @@
 //!
 //! Where the library has another way than mappings of its own, it takes it short of the budget,
 //! [`HEADROOM`] below it ([`claim`], [`Reach::ShortOfHeadroom`]): a view a device would need from
-//! its files goes through dma-bufs instead (`super::vm`'s module docs, "Imports of views"). What
-//! has no other way has the headroom to itself: a view through dma-bufs, a range, a twin or a
-//! stand-in, and the pages an import maps from their files ([`Reach::Whole`]).
+//! its files goes through dma-bufs instead, and a no-copy buffer's or heap's import of such a
+//! view's pages, or of read-only pages with no twin, is refused at the runtime's gate, the buffer
+//! or heap made over a copy (`super::vm`'s module docs, "Imports of views"). What has no other way
+//! has the headroom to itself: a view through dma-bufs, a range, a twin of a rebind's pages or a
+//! stand-in, and the pages a rebind's or a device lend's import maps from their files, which no
+//! gate refuses ([`Reach::Whole`]).
 //!
 //! What would pass the budget first folds the views' runs mapped from their files that no import
 //! a device may pin holds back into dma-bufs (`super::vm::fold_idle`), a mapping per 4 MiB of
@@ -33,7 +36,7 @@
 //! pass the budget is logged where the budget bites, with the setting that raises it: as its
 //! memory is leased where udmabuf is not the process's, as views past the budget are refused
 //! there ([`warn_if_short`]), and as a device that needs imported pages mapped from their files is
-//! made, as imports past the budget are refused there ([`warn_if_imports_short`]).
+//! made, as buffers and heaps past the headroom are copied there ([`warn_if_imports_short`]).
 
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -63,7 +66,8 @@ pub(super) const RESERVE: u64 = 16_384;
 /// library chooses a view's or an import's mappings ([`claim`]): views through dma-bufs, each a
 /// mapping per 4 MiB of scattered pages at udmabuf's stock `list_limit` and one at each end
 /// (`super::vm`'s `map_through`), the ranges views are made of, IOSurface stand-ins' memory,
-/// imports' twins, and the pages imports map from their files ([`Reach::Whole`]). A margin,
+/// rebinds' twins, and the pages rebinds and lends map from their files ([`Reach::Whole`]),
+/// which no gate refuses. A margin,
 /// as [`RESERVE`] is, sized from the views it is for: views through dma-bufs of all of a 16 GiB
 /// guest's pages take 4,096 mappings and two for each view, and the
 /// views held at the 3840 × 2160 death (RTX 5080 Laptop, 16 GiB guest, 2026-10-27), 391 surfaces
@@ -202,8 +206,8 @@ pub(super) enum Reach {
     /// Short of it by [`HEADROOM`]: for what has another way than mappings of its own, which it
     /// takes past that (module docs).
     ShortOfHeadroom,
-    /// All of it, the headroom included: for what has no other way, an import's pages a device
-    /// pins as they are mapped (`super::import`'s `no_room_to_unfold`).
+    /// All of it, the headroom included: for what has no other way, the pages of a rebind's or a
+    /// lend's import a device pins as they are mapped (`super::import`'s `no_room_to_unfold`).
     Whole,
 }
 
@@ -308,11 +312,16 @@ pub(super) fn warn_if_short(guest_ram: u64) {
 
 /// Tells once, where a device of the process needs imported pages mapped from their files
 /// (`super::import`'s `learn_view_imports`) and imports of all of the guest's RAM, in 4 KiB pieces,
-/// would pass the budget: past that much of it, an import is handed over as mapped, which such a
-/// device refuses (`super::import`'s `no_room_to_unfold`). Nothing before the guest's RAM is
-/// leased ([`warn_if_short`] warns then).
+/// would come within the headroom of the budget: past that much of it, buffers and heaps over
+/// guest memory are copied rather than imported (`super::import`'s `import_gate`), which works and
+/// costs the copies, so it is information, not a warning: the setting is a speed-up. Nothing
+/// before the guest's RAM is leased ([`warn_if_short`] warns then).
 pub(super) fn warn_if_imports_short() {
-    short("imports of guest memory are refused", 0, log::Level::Warn);
+    short(
+        "buffers and heaps over guest memory are copied rather than imported, which is slower,",
+        HEADROOM,
+        log::Level::Info,
+    );
 }
 
 /// The line of [`warn_if_short`] and [`warn_if_imports_short`], once for the process at
@@ -417,10 +426,14 @@ mod tests {
         {
             let _limit = Limit::room(0);
             assert!(dies_at_the_budget(|| vm::allocate_aliasable(PAGE)));
-            assert!(dies_at_the_budget(|| import::import_view(p, PAGE)));
+            assert!(dies_at_the_budget(|| import::import_view(p, PAGE, true)));
             assert!(dies_at_the_budget(|| vm::OwnMemory::new(PAGE)));
         }
-        assert_ne!(import::import_view(p, PAGE).at(), p, "a twin with room");
+        assert_ne!(
+            import::import_view(p, PAGE, true).at(),
+            p,
+            "a twin with room"
+        );
         assert!(v.deallocate(at, 2 * PAGE).is_success());
     }
 
@@ -458,7 +471,7 @@ mod tests {
             crate::answer::relaxed(|| {
                 assert_eq!(vm::allocate_aliasable(PAGE).err(), Some(KernReturn(3)));
                 assert!(vm::OwnMemory::new(PAGE).is_none());
-                assert_eq!(import::import_view(p, PAGE).at(), p, "no twin");
+                assert_eq!(import::import_view(p, PAGE, true).at(), p, "no twin");
             });
         }
         assert_eq!(crate::answer::out_of_host_memory_count(), before + 4);

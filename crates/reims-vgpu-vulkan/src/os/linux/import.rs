@@ -25,6 +25,13 @@
 //! pages instead (`super::dma_buf`). The runtime asks for it only where it would refuse the
 //! import otherwise, so every device that imports host memory imports as it did.
 //!
+//! And every import carries the views' gate ([`import_gate`]), which the runtime asks before it
+//! imports a no-copy buffer's or heap's pages, or a buffer's new pages, by their pointer: where
+//! the pages were left in views through dma-bufs for want of mappings, which a device that pins a
+//! pointer's pages refuses, or are read-only with no twin, it refuses, and the runtime makes the
+//! buffer or heap over a copy of them in memory of the device's own instead, which takes no
+//! mapping (its `copied-host-pages`, a kind of `crate::answer::DIES`).
+//!
 //! **What the imported pages cost the GPU** (**measured** 2026-10-26, raw Vulkan with no runtime
 //! between, kernels of our own reading 64 MiB and writing 64 MiB, the median GPU time of five in
 //! ms, device-local memory / the imported pages): the RTX 5080 Laptop GPU on NVIDIA's 615.71.09,
@@ -164,7 +171,17 @@ impl Pinned {
 impl Drop for Pinned {
     fn drop(&mut self) {
         PINNED.lock().remove(&self.0);
+        UNPINNED.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// How many records of [`PINNED`] have dropped, each freeing pages a fold may map through dma-bufs
+/// (`super::vm`'s `fold_short`).
+static UNPINNED: AtomicU64 = AtomicU64::new(0);
+
+/// How many records of [`PINNED`] have dropped ([`UNPINNED`]).
+pub(super) fn unpinned() -> u64 {
+    UNPINNED.load(Ordering::Relaxed)
 }
 
 /// The pages devices may pin now ([`PINNED`]), in order, those that meet joined.
@@ -236,17 +253,25 @@ impl Refused {
     }
 }
 
-/// The imports handed over as mapped ([`no_room_to_unfold`]).
+/// The imports the gate refused for their pages left in views through dma-bufs, which the runtime
+/// copied ([`import_gate`]).
+static COPIED: Refused = Refused::new("nrcopy");
+
+/// The gated imports of read-only pages no twin was made for, short of the headroom of the views'
+/// budget ([`twin`]), which the gate refuses, so the runtime copies them.
+static TWINLESS: Refused = Refused::new("notwin");
+
+/// The imports no gate asks about handed over as mapped ([`no_room_to_unfold`]).
 static HANDED_OVER: Refused = Refused::new("noroom");
 
-/// The import of `first..end`, whose pages lie in views through dma-bufs, where mapping them from
+/// The import of `first..end` by a rebind or a device lend, which no gate asks about
+/// ([`ImportView`]'s `gated`), whose pages lie in views through dma-bufs, where mapping them from
 /// their files would take their `adding` mappings past the views' whole budget, the headroom
-/// included, which an import, having no other way, may take (`super::budget`'s `claim`,
+/// included, which such an import, having no other way, may take (`super::budget`'s `claim`,
 /// `Reach::Whole`): they stay as they are, and the import is handed over as they are mapped,
 /// which a device that pins a pointer's pages refuses (NVIDIA's), as the runtime refuses any
 /// import there, and a lend fails as the host refuses it.
-/// The one place the views' budget refuses an import (`super::vm`'s module docs, "Imports of
-/// views"). Each is counted with its bytes ([`Refused`], trace record `noroom`); in strict mode
+/// Each is counted with its bytes ([`Refused`], trace record `noroom`); in strict mode
 /// (`REIMS_VGPU_STRICT=1`) it ends the process, as a view past the budget does
 /// (`super::budget`'s `admit`).
 pub(crate) fn no_room_to_unfold(first: u64, end: u64, adding: u64) {
@@ -265,6 +290,51 @@ pub(crate) fn no_room_to_unfold(first: u64, end: u64, adding: u64) {
             end - first
         );
     }
+}
+
+/// The views' gate over the runtime's import of a no-copy buffer's or heap's pages, or a buffer's
+/// new pages, by their pointer (`rt::HostMemory::with_import_gate`), which every [`host_memory`]
+/// carries, asked on the thread that makes the buffer, heap or rebind, with no lock of the
+/// runtime's held, after [`import_view`] made what it imports. It refuses read-only pages, which
+/// reach it only where no twin of them was made short of the headroom of the views' budget
+/// ([`twin`], counted there), and, where a device of the process needs imported pages mapped from
+/// their files ([`imports_need_files`]), pages [`import_view`] left in views through dma-bufs, as
+/// mapping them from their files would have come within that headroom (`super::budget`'s
+/// `claim`), each such refusal counted with its bytes ([`Refused`], trace record `nrcopy`). The
+/// runtime then makes the buffer or heap over a copy of the pages, which takes no mapping. A copy
+/// costs every commit and completion a compare of its bytes, so the warning names the setting
+/// that gives room.
+fn import_gate(request: rt::ImportRequest) -> bool {
+    let first = addr_of(request.start);
+    gate(first, first.saturating_add(request.length))
+}
+
+/// [`import_gate`]'s answer for the pages of `first..end`.
+fn gate(first: u64, end: u64) -> bool {
+    if files::writable(first, end - first) == Some(false) {
+        return false;
+    }
+    if !imports_need_files() {
+        return true;
+    }
+    let pieces = files::through_pieces(first, end);
+    if pieces.is_empty() {
+        return true;
+    }
+    let adding = vm::mappings_added(&pieces);
+    if let Some((count, bytes)) = COPIED.count(first, end, adding) {
+        log::warn!(
+            target: "reims_vgpu_vulkan::os",
+            "{count} buffers and heaps of {} KiB in all copied rather than imported, which costs \
+             each command buffer a compare of their bytes: mapping their pages from their files \
+             would have taken the views of memory within {} mappings of their budget \
+             (vm.max_map_count), the latest's {adding} mappings for {:#x} bytes at {first:#x}",
+            bytes >> 10,
+            budget::HEADROOM,
+            end - first
+        );
+    }
+    false
 }
 
 /// The address of `at`.
@@ -424,7 +494,8 @@ impl ImportView {
 }
 
 /// The runtime's host memory at `at`, the first byte of an import ([`ImportView::at`]), with a
-/// source of dma-bufs of its pages for a device that refuses them as host memory (module docs).
+/// source of dma-bufs of its pages for a device that refuses them as host memory, and the views'
+/// gate ([`import_gate`]) (module docs).
 /// The runtime keeps the source while the import lives, and calls it with no lock of its own
 /// held, with a window of the import's pages and the granule it binds chunks at: the whole
 /// import's when it makes it, and a texture's own pages, at a granule of their length, when it
@@ -485,8 +556,11 @@ unsafe fn host_memory_noting(
             }
         }
     });
+    static GATE: std::sync::LazyLock<rt::ImportGate> =
+        std::sync::LazyLock::new(|| Arc::new(import_gate));
     // SAFETY: the caller's.
-    let memory = unsafe { rt::HostMemory::with_dma_buf(at, source) };
+    let memory =
+        unsafe { rt::HostMemory::with_dma_buf(at, source) }.with_import_gate(Arc::clone(&GATE));
     let dirty = logged
         .then(|| super::dirty::ImportDirty::new(shown_at(at).as_ptr().addr().to_u64()))
         .flatten();
@@ -524,10 +598,12 @@ impl SendPtr {
 /// them is mapped writable or one has no file behind it (which the runtime then refuses as it
 /// refuses any import there), and otherwise a writable twin of their pages, at the same offset in
 /// its first page (module docs). Where a device needs imported pages mapped from their files, what
-/// of the bytes lies in views through dma-bufs is mapped from them, as far as the whole budget of
-/// views, since an import has no other way; past it the import is handed over as mapped
-/// ([`no_room_to_unfold`]).
-pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
+/// of the bytes lies in views through dma-bufs is mapped from them, and a twin made: for a
+/// `gated` import, one the runtime asks the gate about (a no-copy buffer's or heap's), short of
+/// the headroom of the views' budget, past which the gate refuses the pages and the runtime copies
+/// them ([`import_gate`]); for another (a rebind's or a lend's), which has no other way, as far as
+/// the whole budget, past which it is handed over as mapped ([`no_room_to_unfold`]).
+pub(crate) fn import_view(at: NonNull<u8>, length: u64, gated: bool) -> ImportView {
     let plain = ImportView {
         at,
         twin: None,
@@ -542,12 +618,19 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
     else {
         return plain;
     };
+    // Only where the gate refuses what does not fit short of the headroom.
+    let reach = match gated && imports_need_files() {
+        true => budget::Reach::ShortOfHeadroom,
+        false => budget::Reach::Whole,
+    };
     // Looked up without collecting the pieces, which only a twin needs.
     if files::writable(first, end - first) != Some(false) {
         // Recorded before its pages are mapped from their files, so no fold maps them back.
         let pinned = Pinned::new(first, end);
+        // A gated import's pages left in views through dma-bufs are refused at the gate.
         if imports_need_files()
-            && let Err(adding) = vm::unfold(first, end, budget::Reach::Whole)
+            && let Err(adding) = vm::unfold(first, end, reach)
+            && reach == budget::Reach::Whole
         {
             no_room_to_unfold(first, end, adding);
         }
@@ -556,7 +639,7 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
     let Some(pieces) = files::pieces(first, end - first) else {
         return plain;
     };
-    let Some(twin) = vm::reclaiming(|| twin(first, end - first, &pieces)) else {
+    let Some(twin) = vm::reclaiming(|| twin(first, end - first, &pieces, reach)) else {
         return plain;
     };
     log::debug!(
@@ -576,16 +659,28 @@ pub(crate) fn import_view(at: NonNull<u8>, length: u64) -> ImportView {
 
 /// A writable twin of the `length` bytes from `first` that `pieces` show: each piece's file
 /// pages, shared, read and write, but zeros', which stay the fresh reservation's own private
-/// zeros; `None` where the host maps none, or the views' budget has no room for it
+/// zeros; `None` where the host maps none, or the views' budget has no room for it as far as
+/// `reach` lets it: short of the headroom, for a gated import ([`twinless`]), or the whole budget
 /// ([`budget::admit`]).
-fn twin(first: u64, length: u64, pieces: &[files::Piece]) -> Option<Twin> {
+fn twin(first: u64, length: u64, pieces: &[files::Piece], reach: budget::Reach) -> Option<Twin> {
     let zeros = of_zeros(pieces);
     let mappings = twin_mappings(pieces, &zeros);
-    // Past the budget no twin, counted: the runtime refuses the read-only pages as it refuses
-    // any import of them.
-    if !budget::admit(mappings, "an import's twin") {
-        return None;
-    }
+    // Held until the twin's mappings are counted.
+    let _claim = match reach {
+        budget::Reach::ShortOfHeadroom => match vm::claim_short(mappings) {
+            Some(claim) => Some(claim),
+            None => {
+                twinless(first, first + length, mappings);
+                return None;
+            }
+        },
+        // Past the budget no twin, counted: the runtime refuses the read-only pages as it
+        // refuses any import of them.
+        budget::Reach::Whole => match budget::admit(mappings, "an import's twin") {
+            true => None,
+            false => return None,
+        },
+    };
     let base = vm::anonymous(None, length, "an import's twin").ok()?;
     let mut twin = Twin {
         first: base,
@@ -602,6 +697,25 @@ fn twin(first: u64, length: u64, pieces: &[files::Piece]) -> Option<Twin> {
     twin.mappings = mappings;
     TWINS.lock().insert(base, (length, first));
     Some(twin)
+}
+
+/// Counts a gated import of the read-only pages `first..end` that no twin was made for, as its
+/// `adding` mappings would have come within the headroom of the views' budget: the gate refuses
+/// the pages, and the runtime copies them ([`TWINLESS`], trace record `notwin`).
+fn twinless(first: u64, end: u64, adding: u64) {
+    if let Some((count, bytes)) = TWINLESS.count(first, end, adding) {
+        log::warn!(
+            target: "reims_vgpu_vulkan::os",
+            "{count} buffers and heaps over read-only pages, of {} KiB in all, copied rather \
+             than imported, which costs each command buffer a compare of their bytes: a writable \
+             twin of their pages would have taken the views of memory within {} mappings of \
+             their budget (vm.max_map_count), the latest's {adding} mappings for {:#x} bytes at \
+             {first:#x}",
+            bytes >> 10,
+            budget::HEADROOM,
+            end - first
+        );
+    }
 }
 
 /// The kernel's mappings a twin of `pieces` takes, `zeros` saying which are of zeros: one for each
@@ -676,13 +790,13 @@ mod tests {
         let at = vm::allocate_aliasable(2 * PAGE).unwrap();
         let first = at.addr().to_u64();
         let p = address(first + 0x40).unwrap();
-        let view = import_view(p, PAGE);
+        let view = import_view(p, PAGE, true);
         assert_eq!(view.at(), p, "writable: the memory itself");
         assert!(!view.writes_kept());
         let (run, kept) = view.release(p, None);
         assert!(run.is_none() && kept.is_none());
         assert!(vm.protect_max(at, 2 * PAGE, VmProt::READ).is_ok());
-        let view = import_view(p, PAGE);
+        let view = import_view(p, PAGE, true);
         assert!(view.writes_kept());
         let twin = addr(view.at());
         assert_ne!(twin, addr(p));
@@ -753,7 +867,7 @@ mod tests {
         }
         assert!(vm.protect_max(view, 4 * PAGE, VmProt::READ).is_ok());
         let p = address(view.addr().to_u64()).unwrap();
-        let import = import_view(p, 4 * PAGE);
+        let import = import_view(p, 4 * PAGE, true);
         let twin = addr(import.at());
         assert_ne!(twin, addr(p));
         assert_eq!(vm::tests::kernel_mappings(twin, twin + 4 * PAGE), 2);
@@ -772,7 +886,7 @@ mod tests {
         assert!(zeros(&files::pieces(first, 1).unwrap()[0].backing.fd));
         assert!(vm.protect_max(at, PAGE, VmProt::READ).is_ok());
         let p = address(first).unwrap();
-        let view = import_view(p, PAGE);
+        let view = import_view(p, PAGE, true);
         let twin = addr(view.at());
         assert_ne!(twin, first);
         assert_eq!(read(twin), 0);
@@ -799,7 +913,7 @@ mod tests {
         }];
         let alias = crate::gpu::backing::gather("test", &ranges, 3 * PAGE, true).unwrap();
         let at = alias.first();
-        let view = import_view(at, 3 * PAGE);
+        let view = import_view(at, 3 * PAGE, true);
         let twin = addr(view.at());
         assert_ne!(twin, addr(at), "a twin");
         assert_eq!(read(twin + 5), 0x6b, "the guest's page");
@@ -849,19 +963,22 @@ mod tests {
         let at = vm.allocate_anywhere(PAGE).unwrap();
         assert!(vm.protect_max(at, PAGE, VmProt::READ).is_ok());
         let p = NonNull::new(at.as_ptr::<u8>()).unwrap();
-        assert_eq!(import_view(p, PAGE).at(), p);
+        assert_eq!(import_view(p, PAGE, true).at(), p);
         assert!(vm.deallocate(at, PAGE).is_success());
     }
 
     /// Where a device of the process needs imported pages mapped from their files, a view that
     /// from its files would come within the headroom of the views' budget is mapped through a
-    /// dma-buf, though the budget has room for it. An import of it, which has no other way, maps
-    /// the pages from their files into the headroom; past the whole budget it is handed over as it
-    /// is mapped by default, counted with its bytes, and ends the process in strict mode. Where
-    /// udmabuf does not open, the view is mapped from its files, and ends the process past the
-    /// budget. The flag is the process's, which nextest runs this test alone in.
+    /// dma-buf, though the budget has room for it. A gated import of it (a buffer's or a heap's)
+    /// leaves it so, and the gate refuses its pages, counted with their bytes, in strict mode too,
+    /// as the runtime copies them. An import no gate asks about (a rebind's or a lend's), which
+    /// has no other way, maps the pages from their files into the headroom, which the gate then
+    /// lets through; past the whole budget it is handed over as it is mapped by default, counted
+    /// with its bytes, and ends the process in strict mode. Where udmabuf does not open, the view
+    /// is mapped from its files, and ends the process past the budget. The flag is the process's,
+    /// which nextest runs this test alone in.
     #[test]
-    fn past_the_budget_imports_are_handed_over_as_mapped() {
+    fn past_the_headroom_gated_imports_are_refused_at_the_gate() {
         use reims_vgpu_core::raise::death::DeathKind;
         use reims_vgpu_core::testkit::capture::catch_death;
         fn dies<R>(f: impl FnOnce() -> R) -> bool {
@@ -895,20 +1012,29 @@ mod tests {
             let (first, end) = (addr(p), addr(p) + n * PAGE);
             let mappings = || vm::tests::kernel_mappings(first, end);
             assert_eq!(mappings(), 1, "the view, through a dma-buf");
+            let handed = counted(&HANDED_OVER);
+            let gated = import_view(p, n * PAGE, true);
+            assert_eq!((gated.at(), mappings()), (p, 1), "a gated import's, left");
+            let (copied, copied_bytes) = counted(&COPIED);
+            assert!(!gate(first, end), "refused at the gate");
+            assert_eq!(counted(&COPIED), (copied + 1, copied_bytes + n * PAGE));
+            assert_eq!(counted(&HANDED_OVER), handed, "none handed over");
+            drop(gated);
             // No room past the budget's headroom either.
             budget::set_test_limit(Some(limit(8)));
-            assert!(dies(|| import_view(p, n * PAGE)), "strict");
+            assert!(dies(|| import_view(p, n * PAGE, false)), "strict");
             let (handed, handed_bytes) = counted(&HANDED_OVER);
-            let import = crate::answer::relaxed(|| import_view(p, n * PAGE));
+            let import = crate::answer::relaxed(|| import_view(p, n * PAGE, false));
             assert_eq!((import.at(), mappings()), (p, 1), "handed over as mapped");
             assert_eq!(counted(&HANDED_OVER), (handed + 1, handed_bytes + n * PAGE));
             budget::set_test_limit(Some(limit(budget::HEADROOM + 8)));
-            let import = import_view(p, n * PAGE);
+            let import = import_view(p, n * PAGE, false);
             assert_eq!(
                 (import.at(), mappings()),
                 (p, n),
                 "from their files in the headroom"
             );
+            assert!(gate(first, end), "let through");
         } else {
             budget::set_test_limit(Some(limit(n)));
             assert!(dies(|| vm.remap_runs_shared_overwrite(view, &runs)));
@@ -916,6 +1042,34 @@ mod tests {
         budget::set_test_limit(None);
         assert!(vm.deallocate(view, n * PAGE).is_success());
         assert!(vm.deallocate(src, n * PAGE).is_success());
+    }
+
+    /// Where a device of the process needs imported pages mapped from their files, a gated
+    /// import of read-only pages whose twin would come within the headroom of the views' budget
+    /// gets none, counted with its bytes: the gate refuses the pages, read-only, so the runtime
+    /// copies them. With room, the twin is made, which the gate lets through. The flag is the
+    /// process's, which nextest runs this test alone in.
+    #[test]
+    fn a_gated_import_with_no_room_for_a_twin_is_refused_at_the_gate() {
+        IMPORTS_NEED_FILES.store(true, Ordering::Relaxed);
+        let vm = LinuxVm::new();
+        let at = vm::allocate_aliasable(2 * PAGE).unwrap();
+        assert!(vm.protect_max(at, 2 * PAGE, VmProt::READ).is_ok());
+        let p = NonNull::new(at.as_ptr::<u8>()).unwrap();
+        let (first, end) = (addr(p), addr(p) + PAGE);
+        let before = TWINLESS.count.load(Ordering::Relaxed);
+        budget::set_test_limit(Some(budget::held() + budget::RESERVE + budget::HEADROOM));
+        let view = import_view(p, PAGE, true);
+        assert_eq!(view.at(), p, "no twin");
+        assert!(!gate(first, end), "refused, read-only");
+        assert_eq!(TWINLESS.count.load(Ordering::Relaxed), before + 1);
+        budget::set_test_limit(None);
+        let view = import_view(p, PAGE, true);
+        assert_ne!(view.at(), p, "a twin");
+        let twin = addr(view.at());
+        assert!(gate(twin, twin + PAGE), "the twin let through");
+        drop(view);
+        assert!(vm.deallocate(at, 2 * PAGE).is_success());
     }
 
     /// Where a device of the process imports by pointer only pages mapped from their files, an
@@ -952,11 +1106,11 @@ mod tests {
         write(first + 7, 0x77);
         IMPORTS_NEED_FILES.store(true, std::sync::atomic::Ordering::Relaxed);
         let p = NonNull::new(view.as_ptr::<u8>()).unwrap();
-        let whole = import_view(p, n * PAGE);
+        let whole = import_view(p, n * PAGE, true);
         assert_eq!((whole.at(), mappings(first, end)), (p, n), "imported");
         assert_eq!(read(first + 7), 0x77);
         drop(whole);
-        let again = import_view(address(first + 4 * PAGE).unwrap(), 2 * PAGE);
+        let again = import_view(address(first + 4 * PAGE).unwrap(), 2 * PAGE, true);
         drop(again);
         assert_eq!(mappings(first, end), n, "no import");
         assert_eq!(read(first + 7), 0x77);

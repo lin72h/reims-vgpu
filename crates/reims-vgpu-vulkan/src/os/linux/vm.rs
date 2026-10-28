@@ -72,10 +72,15 @@
 //! a mapping a run, and an import of a view made through dma-bufs before maps what of its pages
 //! lies in them from their files for as long as the view lives ([`unfold`]). Where those
 //! mappings would come within the headroom of the views' budget (`super::budget`'s `claim`), a
-//! view is mapped through dma-bufs there too, and no view ends the process. An import of pages
-//! left in dma-bufs for want of mappings, which has no other way, maps them from their files into
-//! the headroom, and only past the whole budget is handed over as mapped, which such a device
-//! refuses (`super::import`'s `no_room_to_unfold`).
+//! view is mapped through dma-bufs there too, and no view ends the process. A no-copy buffer's or
+//! heap's import of pages left in dma-bufs for want of mappings, which the runtime asks the
+//! views' gate about, maps them from their files only short of that headroom, the views no import
+//! holds folded back first where that may free some ([`fold_short_due`]); past it the gate
+//! refuses them, and the runtime makes the buffer or heap over a copy of them, which takes no
+//! mapping (`super::import`'s `import_gate`). A rebind's and a device lend's, which no gate
+//! refuses and which have no other way, map them from their files into the headroom, and only past
+//! the whole budget are handed over as mapped, which such a device refuses (`super::import`'s
+//! `no_room_to_unfold`).
 //!
 //! **Folding back.** At the views' budget, before anything is refused, the views' runs mapped
 //! from their files that no import a device may pin holds (`super::import`'s `Pinned`) are mapped
@@ -195,6 +200,50 @@ fn fold_within(within: std::ops::Range<u64>) -> u64 {
         );
     }
     freed
+}
+
+/// The views' mappings and the imports freed (`super::import`'s `unpinned`) as the last fold for
+/// a claim short of the headroom ended ([`fold_short`]); `u64::MAX` before the first.
+static SHORT_FOLDED: [std::sync::atomic::AtomicU64; 2] = [
+    std::sync::atomic::AtomicU64::new(u64::MAX),
+    std::sync::atomic::AtomicU64::new(u64::MAX),
+];
+
+/// Whether a claim short of the headroom the budget refused may fold the views no import holds
+/// back into dma-bufs ([`fold_short`]): only where the views' mappings grew or an import was freed
+/// since the last such fold ended, as only those give a fold more to free, and a fold reads every
+/// run of the backing table, a million at a `vm.max_map_count` of 1,048,576, holding the views'
+/// lock to write.
+fn fold_short_due() -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let [mappings, unpinned] = &SHORT_FOLDED;
+    let last = mappings.load(Relaxed);
+    last == u64::MAX
+        || files::mappings() > last
+        || super::import::unpinned() != unpinned.load(Relaxed)
+}
+
+/// [`fold_idle`], for a claim short of the headroom: the gated import of guest pages (a no-copy
+/// buffer's or heap's, `super::import`'s `import_view`) folds the views no import holds before
+/// the runtime copies it for want of mappings, as a copy costs each command buffer a compare of
+/// its bytes, and a fold only a remap of the pages it folds.
+fn fold_short() {
+    use std::sync::atomic::Ordering::Relaxed;
+    let unpinned = super::import::unpinned();
+    fold_idle();
+    SHORT_FOLDED[0].store(files::mappings(), Relaxed);
+    SHORT_FOLDED[1].store(unpinned, Relaxed);
+}
+
+/// Claims `adding` mappings short of the headroom of the views' budget for a gated import's twin
+/// (`super::import`'s `twin`), the views no import holds folded first where the budget refuses and
+/// a fold may free something ([`fold_short_due`]).
+pub(super) fn claim_short(adding: u64) -> Option<budget::Claim> {
+    let reach = budget::Reach::ShortOfHeadroom;
+    budget::claim(adding, reach).or_else(|| {
+        fold_short_due().then(fold_short)?;
+        budget::claim(adding, reach)
+    })
 }
 
 thread_local! {
@@ -651,7 +700,7 @@ fn put_back(at: u64, length: u64) {
 /// The most mappings a view of `pieces` adds: one for each run of them the kernel holds as one
 /// (each piece following the one before in the same file at the same protection), and one more
 /// where the view cuts a run of its target in two.
-fn mappings_added(pieces: &[files::Piece]) -> u64 {
+pub(super) fn mappings_added(pieces: &[files::Piece]) -> u64 {
     let follows = |a: &files::Piece, b: &files::Piece| {
         Arc::ptr_eq(&a.backing.fd, &b.backing.fd)
             && a.backing.offset + a.length == b.backing.offset
@@ -844,12 +893,20 @@ fn unfold_once(first: u64, end: u64, reach: budget::Reach) -> Result<(), u64> {
         return Ok(());
     }
     let mut adding = mappings_added(&pieces);
-    // Held until the pieces are recorded, which counts them. An import with no other way folds
-    // the views no import holds first, its own pages among those held (module docs).
+    // Held until the pieces are recorded, which counts them. An import folds the views no import
+    // holds first, its own pages among those held (module docs): one with no other way always,
+    // a gated one where a fold may free something since the last ([`fold_short`]).
     let mut claim = budget::claim(adding, reach);
-    if claim.is_none() && reach == budget::Reach::Whole {
+    let fold = match reach {
+        budget::Reach::Whole => true,
+        budget::Reach::ShortOfHeadroom => claim.is_none() && fold_short_due(),
+    };
+    if claim.is_none() && fold {
         drop(held);
-        fold_idle();
+        match reach {
+            budget::Reach::Whole => drop(fold_idle()),
+            budget::Reach::ShortOfHeadroom => fold_short(),
+        }
         held = views();
         pieces = files::through_pieces(first, end);
         if pieces.is_empty() {

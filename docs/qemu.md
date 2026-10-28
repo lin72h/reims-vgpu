@@ -700,18 +700,26 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
   into a udmabuf mapping and the dma-buf itself. A probe finds this as the
   device is made. From then on, views are mapped from their files while they
   fit 8,192 mappings short of the budget (`budget.rs`, `HEADROOM`), and
-  through dma-bufs past that. An import of a view's pages, which has no
-  other way, maps them from their files, into those 8,192 mappings too. Only
-  past the whole budget is it handed over as mapped, which the driver
-  refuses, and the runtime refuses the import as it refuses any import there;
-  with `REIMS_VGPU_STRICT=1` it ends the process. A buffer's import of
-  read-only pages needs a writable twin of them, which may take the whole
-  budget too. On such a host a raised limit lets more imports through.
+  through dma-bufs past that. A no-copy buffer's or heap's import of a view's
+  pages maps them from their files while they fit short of those 8,192
+  mappings too, as does the writable twin a buffer's import of read-only
+  pages needs. Past that line the library's import gate refuses the pages,
+  and the runtime makes the buffer or heap over a copy of them in the GPU's
+  own memory, which takes no mapping: it works, but costs each command buffer
+  a compare of the copy's bytes, so a raised limit is a speed-up
+  (metal2vulkan's `HostMemory::with_import_gate`, announced
+  `copied-host-pages`; with `REIMS_VGPU_STRICT=1` it ends the process). A
+  rebind's or a device lend's import has no other way, and maps its pages
+  from their files into the 8,192 mappings too. Only past the whole budget
+  is it handed over as mapped, which the driver refuses; with
+  `REIMS_VGPU_STRICT=1` it ends the process.
 - **Before anything would die or be refused at the whole budget**, the
   library folds back into dma-bufs the views' pages mapped from their files
   that no live import a device may pin holds, and weighs again (`vm.rs`,
   "Folding back"). Only where that frees too little is a view or an import
-  refused. A map the kernel itself refuses at `vm.max_map_count`, when the
+  refused. A buffer's or heap's import short of the headroom folds the same
+  way before it is copied, where the views grew or an import was freed since
+  the last such fold. A map the kernel itself refuses at `vm.max_map_count`, when the
   rest of the process holds more than the 16,384 kept for it, folds the same
   way and is tried once more.
 - **What is refused for want of mappings** answers as the same call does on
@@ -741,13 +749,16 @@ What gets logged:
   leased, if the RAM at a mapping per 4 KiB page would not fit.
 - Each answer given for want of mappings, counted, at the first and at each
   power of two.
-- On a device that needs pages mapped from their files, a warning if imports
-  of all of the guest's RAM, a mapping per 4 KiB page, would pass the budget,
-  with the `sysctl -w vm.max_map_count=...` value that covers them (2^23,
-  8,388,608, for a 16 GiB guest).
-- Each import handed over as mapped is counted with its bytes, logged at the
-  first and at each power of two, and written to the trace (`noroom`: first
-  byte, length, mappings it would have taken).
+- On a device that needs pages mapped from their files, an information line
+  if imports of all of the guest's RAM, a mapping per 4 KiB page, would come
+  within the headroom of the budget, with the `sysctl -w
+  vm.max_map_count=...` value that covers them (2^23, 8,388,608, for a 16 GiB
+  guest): past that, buffers and heaps are copied.
+- Each buffer or heap copied for want of mappings, and each import handed
+  over as mapped, is counted with its bytes, logged at the first and at each
+  power of two, and written to the trace (`nrcopy` for pages left in
+  dma-bufs, `notwin` for read-only pages with no twin, `noroom` for an
+  import handed over: first byte, length, mappings it would have taken).
 
 ### Linux hosts: AMD GPUs and udmabuf
 
