@@ -211,13 +211,13 @@ pub enum Maker {
 pub(crate) fn format_set(sel: &'static str, raw: u64) -> (PixelFormat, Option<u64>, Option<u64>) {
     if crate::gpu::no_texture::taken(raw) {
         (PixelFormat::Invalid, Some(raw), None)
-    } else if !crate::gpu::format_info::setter_takes(sel, raw) {
+    } else if !crate::gpu::format_info::setter_takes(raw) {
         metal_aborts(
             sel,
             &format!("pixel format {raw}, not a valid MTLPixelFormat"),
         )
     } else {
-        match crate::gpu::set_format(sel, raw) {
+        match crate::gpu::held_format(sel, raw) {
             Ok(pf) => (pf, None, None),
             Err(raw) => (PixelFormat::Invalid, None, Some(raw)),
         }
@@ -387,10 +387,7 @@ impl TextureFields {
     /// does (its measurement on an M3 Max under macOS 26.7), a
     /// rotation `maker` does not take ([`TextureFields::rotation_taken`]),
     /// `framebufferOnly` where `maker` is a device's, a buffer's or a heap's ([`Maker::Other`]),
-    /// and a usage bit Metal does not define (the module's docs); then a format the releases the
-    /// runtime measured make a texture of otherwise, which dies on a host whose release it has not
-    /// measured, but where the shared creator answers nil first
-    /// ([`TextureFields::made_at_level`]).
+    /// and a usage bit Metal does not define (the module's docs).
     ///
     /// A descriptor of a format Metal makes no texture of from a descriptor alone
     /// ([`TextureFields::formatless`]) meets none of these checks from any `maker` but the
@@ -430,23 +427,6 @@ impl TextureFields {
         }
     }
 
-    /// Asks the Metal level at `sel`, a creator of a texture of this descriptor, where the
-    /// releases the runtime measured make a texture of its format otherwise: a format one
-    /// describes and makes a texture of, and another describes none for and asserts at a texture
-    /// of ([`crate::gpu::format_info::level_decides`]), which no value is at the runtime's levels
-    /// (an Apple M4 under macOS 27.0.1 describes 630 to 645, which neither level does). On a host
-    /// whose release the runtime has not measured `sel` dies, naming the level
-    /// ([`crate::platform::answering_level`]), before any check that follows from the format;
-    /// on a measured one the level's answer follows, as `setPixelFormat:` held the format by it.
-    fn made_at_level(&self, sel: &'static str) {
-        let raw = self.raw_pixel_format();
-        if crate::gpu::format_info::level_decides(raw) {
-            crate::platform::answering_level(sel, || {
-                format!("whether Metal makes a texture of pixel format {raw}")
-            });
-        }
-    }
-
     /// The runtime's descriptor after the checks of every format ([`TextureFields::descriptor`]).
     /// Over an IOSurface it holds a rotation other than 0, which only a `framebufferOnly` descriptor
     /// passes the checks with, and `framebufferOnly` with it, as the runtime takes a rotation
@@ -478,9 +458,6 @@ impl TextureFields {
         const PRIVATE: u64 = 2;
         let d = &self.desc;
         let nil_first = maker == Maker::Shared && (d.resource_options.raw() >> 4) & 0xf != PRIVATE;
-        if !nil_first {
-            self.made_at_level(sel);
-        }
         if let Some(raw) = self.lacked_format {
             lacked(sel, raw);
         }

@@ -1456,7 +1456,7 @@ pub fn tile(
                     0 => {}
                     1 => {
                         let raw = u64::from(r.value(COLORS, item));
-                        if !crate::gpu::format_info::setter_takes(TILE_SEL, raw) {
+                        if !crate::gpu::format_info::setter_takes(raw) {
                             metal_aborts(
                                 TILE_SEL,
                                 &format!("pixel format {raw}, not a valid MTLPixelFormat"),

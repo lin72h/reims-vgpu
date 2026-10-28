@@ -365,17 +365,15 @@ mod tests {
         }
     }
 
-    /// No format any Metal level the runtime measured describes holds a block of more bytes
-    /// than a fill's copy of its pattern keeps ([`MOST_PATTERN_BYTES`]), so every texel a fill
-    /// writes is cut from bytes it copied
+    /// No format Metal describes holds a block of more bytes than a fill's copy of its pattern
+    /// keeps ([`MOST_PATTERN_BYTES`]), so every texel a fill writes is cut from bytes it copied
     #[test]
     fn no_block_is_longer_than_a_fills_pattern() {
         let most = u64::try_from(MOST_PATTERN_BYTES).unwrap();
-        for level in metal2vulkan_runtime::MetalLevel::ALL {
-            for raw in 0..2048 {
-                let [bytes, ..] = level.pixel_format_info(raw).words;
-                assert!(bytes <= most, "{level:?} format {raw}: {bytes} bytes");
-            }
+        let d = crate::gpu::device::tests::dev();
+        for raw in 0..2048 {
+            let [bytes, ..] = d.raw.pixel_format_info(raw).words;
+            assert!(bytes <= most, "format {raw}: {bytes} bytes");
         }
     }
 

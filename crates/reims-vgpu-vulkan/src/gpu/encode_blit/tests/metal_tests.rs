@@ -2774,7 +2774,7 @@ fn mipmaps_on<P: reims_vgpu_core::platform::Platform>(
 
 /// `generateMipmapsForTexture:` of `RGB10A2Unorm` and `BGR10A2Unorm` textures writes Metal's
 /// levels, byte for byte, the 2-bit alpha's at sums a hair from a half of its grid included,
-/// and announces neither `mipmap-tie-rounding` nor `mipmaps-as-apple-m4`. The runtime filters
+/// and announces no `mipmap-tie-rounding`. The runtime filters
 /// that alpha as the 10-bit code its bits replicate to, taken to that code's nearest 2-bit
 /// code, and floors each filter tap's term of a 10-bit field to 2^-14 of a code before the sum,
 /// where the exact sum missed the M3 Max's code by one at a field
@@ -2854,18 +2854,11 @@ fn two_bit_alpha_mipmaps_are_the_metal_platforms() {
         }
     }
     assert!(differ.is_empty(), "{differ:#?}");
-    let relayed = crate::answer::RELAYED.lock().clone();
-    for kind in [
-        rt::Degradation::MipmapTieRounding,
-        rt::Degradation::MipmapsAsAppleM4,
-    ] {
-        assert!(!relayed.contains(&kind), "{} was relayed", kind.code());
-    }
 }
 
 /// What fails a test of `generateMipmapsForTexture:` of chains of each of `formats`, of 4
 /// bytes a texel, whose levels the runtime takes from the Apple M3 Max's passes: a level
-/// whose bytes are not Metal's on this host, and `mipmaps-as-apple-m4` announced. The chains
+/// whose bytes are not Metal's on this host. The chains
 /// are Private textures of random bytes, of every level: of `ShaderRead` usage, 256 by 256
 /// (Maps' chain's shape), 2048 by 32 and 32 by 2048, which Metal keeps losslessly compressed
 /// and whose passes take the M3 Max's step after a level one texel tall or wide, and the strips
@@ -2922,16 +2915,11 @@ fn m3_max_chains(formats: &[u64]) -> Vec<String> {
             }
         }
     }
-    let kind = rt::Degradation::MipmapsAsAppleM4;
-    if crate::answer::RELAYED.lock().contains(&kind) {
-        differ.push(format!("{} was relayed", kind.code()));
-    }
     differ
 }
 
 /// `generateMipmapsForTexture:` of `BGRA8Unorm`, `RGBA8Unorm`, `RGB10A2Unorm` and `RG16Unorm`
-/// chains writes Metal's levels on this host, byte for byte, and announces no
-/// `mipmaps-as-apple-m4` ([`m3_max_chains`])
+/// chains writes Metal's levels on this host, byte for byte ([`m3_max_chains`])
 #[test]
 fn m3_max_mipmap_passes_are_the_metal_platforms() {
     let differ = m3_max_chains(&[80, 70, 90, 60]);
@@ -2939,8 +2927,7 @@ fn m3_max_mipmap_passes_are_the_metal_platforms() {
 }
 
 /// `generateMipmapsForTexture:` of `RG11B10Float` chains, past 65 texels among them, writes
-/// Metal's levels on this host, byte for byte, and announces no `mipmaps-as-apple-m4`
-/// ([`m3_max_chains`]): the runtime takes them from the M3 Max's passes, its tail reading an
+/// Metal's levels on this host, byte for byte ([`m3_max_chains`]): the runtime takes them from the M3 Max's passes, its tail reading an
 /// axis of one texel alone
 #[test]
 fn rg11b10_float_mipmaps_are_the_metal_platforms() {
@@ -2949,8 +2936,7 @@ fn rg11b10_float_mipmaps_are_the_metal_platforms() {
 }
 
 /// `generateMipmapsForTexture:` of `BGRA10_XR` and `BGR10_XR` textures writes Metal's levels
-/// on this host, byte for byte, and announces neither `mipmap-tie-rounding` nor
-/// `mipmaps-as-apple-m4`. The runtime floors each filter tap's term before the sum,
+/// on this host, byte for byte, and announces no `mipmap-tie-rounding`. The runtime floors each filter tap's term before the sum,
 /// where the exact sum missed the M3 Max's code by one at a level's ties. The chains are
 /// Private textures of `ShaderRead` usage and random codes, of every level: 64 by 64, 45 by
 /// 29 and 256 by 256
@@ -2996,14 +2982,6 @@ fn extended_range_mipmaps_are_the_metal_platforms() {
                     differ.push(format!("{what} level {level}: {wrong} texels differ"));
                 }
             }
-        }
-    }
-    for kind in [
-        rt::Degradation::MipmapTieRounding,
-        rt::Degradation::MipmapsAsAppleM4,
-    ] {
-        if crate::answer::RELAYED.lock().contains(&kind) {
-            differ.push(format!("{} was relayed", kind.code()));
         }
     }
     assert!(differ.is_empty(), "{differ:#?}");

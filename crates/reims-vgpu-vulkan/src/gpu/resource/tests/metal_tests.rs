@@ -5314,8 +5314,7 @@ fn block_writes_only_sizes_are_metals_and_fit() {
 }
 
 /// A PVRTC texture's size and alignment in Metal's heaps are Metal's: the runtime models
-/// PVRTC's layout there at macOS 27.0.1, this host's level (its `unmeasured-heap-texture-size`
-/// names a PVRTC texture at 26.7 alone, [`crate::answer::HEARD`]). `newTextureWithDescriptor:`
+/// PVRTC's layout there. `newTextureWithDescriptor:`
 /// of the suite's texture of each PVRTC format (`textures_formats`: 2D, 16x16, one level,
 /// `Private`, `ShaderRead`, `allowGPUOptimizedContents` off) is made, and the size query
 /// answers Metal's; its placement in a heap is made, one at the heap's end is nil, and a 32x32
@@ -6201,10 +6200,8 @@ where
 
 /// Every colour format Metal describes on this host that the runtime makes textures of, with
 /// its block's bytes and extent: neither a depth or stencil format, nor a two-plane one (550,
-/// 551, which [`Placements`] keeps apart), nor a PVRTC one, whose size the runtime does not model
-/// ([`crate::gpu::metal_space::unmeasured_size`]), nor one of 630 to 645, which an Apple M4 under
-/// macOS 27.0.1 describes and neither of the runtime's levels does, whose layout this platform's
-/// rules take from macOS 26.7 ([`crate::gpu::format_info`]), nor `R10Unorm_PACKED` or
+/// 551, which [`Placements`] keeps apart), nor a PVRTC one, nor one of 630 to 645, which an Apple
+/// M4 describes and the runtime does not ([`crate::gpu::format_info`]), nor `R10Unorm_PACKED` or
 /// `RG10Unorm_PACKED` (588, 589), whose size Metal answers as 0 bytes, so no heap's bytes show
 /// them (their placement: `gpu::device`'s `packed_10_bit_textures_over_memory_die_named`).
 fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
@@ -6218,9 +6215,8 @@ fn legacy_heap_formats() -> Vec<(u64, FormatBlock)> {
             pf.is_some_and(|pf| !metal2vulkan::metal::format::is_depth_stencil(pf))
         })
         .filter(|&raw| !matches!(raw, 160..=167 | 550 | 551 | 588 | 589))
-        .filter(|&raw| !crate::gpu::format_info::level_decides(raw))
         .filter_map(|raw| {
-            let block = crate::gpu::format_info::block(sel, raw, "a heap texture of");
+            let block = crate::gpu::format_info::block(sel, raw);
             let [bw, bh] = block.extent();
             (block.bytes() > 0).then_some((raw, (block.bytes(), (bw, bh))))
         })

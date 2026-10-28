@@ -86,11 +86,6 @@ pub(crate) fn open_loader() -> Result<ash::Entry, ash::LoadingError> {
     opened
 }
 
-/// The macOS release whose Metal the runtime's devices answer as where releases differ
-/// (`DeviceOptions::metal_level`): none named, so the host's own, or the newest measured release
-/// below it, as the host's Metal answers ([`crate::platform::metal_level`]).
-pub const METAL_LEVEL: Option<rt::MetalLevel> = None;
-
 /// `registryID` of the system default `MTLDevice` (`MTLCreateSystemDefaultDevice()`), asked
 /// of Metal once, on the first call that finds a device: `None` where Metal has none. It is
 /// the registry ID of the device MoltenVK runs the runtime's default device on where the Mac

@@ -14,7 +14,6 @@
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 use metal2vulkan_runtime as rt;
@@ -164,21 +163,14 @@ impl VulkanPlatform {
             rt::Device::system_default_with(device_options()).map(|d| vec![d])
         })
         .pop()
-        .map(|raw| device::adopt("MTLCreateSystemDefaultDevice()", raw))
+        .map(device::adopt)
     }
 }
 
 /// The devices `make` makes, a creator standing for `sel` (`MTLCreateSystemDefaultDevice()`,
 /// `MTLCopyAllDevices()`): none where the runtime finds no Vulkan device it can use, or no Vulkan
-/// loader. Any other refusal dies at `sel`, naming it: a macOS host below every release whose
-/// Metal the runtime measured among them, or whose release does not read
-/// (`Problem::HostReleaseUnmeasured`), where the runtime refuses every device, as it cannot answer
-/// that release's Metal. On a host of a release the runtime has not measured above one it has,
-/// the runtime makes the devices at the newest measured release below the host's and announces
-/// it as it makes one, on this thread (`MetalLevelBelowHost`, [`crate::answer::HEARD`]): the
-/// devices are made, and [`BELOW_HOST`] keeps it, so each answer that depends on the release dies
-/// where it is asked ([`answering_level`]). A device that lists a window extension the options
-/// name but lacks its feature (`Error::ExtensionFeature`, `swapchainMaintenance1`) dies at `sel`
+/// loader. Any other refusal dies at `sel`, naming it. A device that lists a window extension the
+/// options name but lacks its feature (`Error::ExtensionFeature`, `swapchainMaintenance1`) dies at `sel`
 /// too, naming the extension and the feature: the runtime refuses it rather than enable the
 /// extension without the feature, and the window's probe names the extension only where every
 /// device has the feature, asked as the runtime asks ([`crate::os::add_window_extensions`]). So
@@ -189,18 +181,10 @@ fn made_devices(
     sel: &'static str,
     make: impl FnOnce() -> Result<Vec<rt::Device>, rt::Error>,
 ) -> Vec<rt::Device> {
-    let (made, heard) = crate::answer::hearing(|| {
-        get(sel, || match make() {
-            Err(rt::Error::NoDevice | rt::Error::LoaderNotFound(_)) => Ok(Vec::new()),
-            made => made,
-        })
-    });
-    if heard.contains(&rt::Degradation::MetalLevelBelowHost) {
-        // Relaxed: stored before the level is kept ([`answered_at`], a `OnceLock`, whose read
-        // acquires it), and read after it.
-        BELOW_HOST.store(true, Ordering::Relaxed);
-    }
-    made
+    get(sel, || match make() {
+        Err(rt::Error::NoDevice | rt::Error::LoaderNotFound(_)) => Ok(Vec::new()),
+        made => made,
+    })
 }
 
 /// The creator [`Platform::open_device`] stands for, which its deaths name.
@@ -233,87 +217,35 @@ fn opened(
     };
     of_id(default())
         .or_else(|| of_id(every()))
-        .map(|raw| device::adopt(OPEN_DEVICE, raw))
+        .map(device::adopt)
 }
 
-/// Whether the runtime announced that its devices answer as a release below the host's
-/// (`MetalLevelBelowHost`, [`made_devices`]): the host's release is not one it measured.
-static BELOW_HOST: AtomicBool = AtomicBool::new(false);
-
-/// The Metal level of an answer `sel` gives that depends on it ([`metal_level`]): `what`, which
-/// the releases the runtime measured answer otherwise. On a host whose own release the runtime
-/// has not measured ([`BELOW_HOST`]) the devices answer as the newest measured release below it,
-/// and the host's Metal may answer otherwise, so `sel` relays it there, naming `what` and the
-/// level, and dies in strict mode ([`crate::answer::Inexact::MetalLevel`]). The level either way.
-pub(crate) fn answering_level(sel: &'static str, what: impl FnOnce() -> String) -> rt::MetalLevel {
-    let level = metal_level(sel);
-    if BELOW_HOST.load(Ordering::Relaxed) {
-        crate::answer::inexact(sel, crate::answer::Inexact::MetalLevel, || {
-            format!(
-                "{}, which Metal's releases answer differently: this host's macOS release is not \
-                 one the Vulkan runtime measured, and its devices answer as {level}, the newest \
-                 measured release below it",
-                what()
-            )
+/// A device of the process, for an answer every device gives alike, at the one macOS release
+/// whose Metal the runtime answers as (`rt::MACOS_RELEASE`): a pixel format's description and a
+/// texture level's layout ([`crate::gpu::format_info`]). The first device the platform adopted;
+/// asked before any is, the runtime's system default device, made for it, which dies as
+/// [`made_devices`] does where the runtime makes none, at `sel`, the call that asks. Kept once
+/// found, as the platform keeps every device it adopts.
+pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
+    static DEVICE: OnceLock<rt::Device> = OnceLock::new();
+    if let Some(kept) = DEVICE.get() {
+        return kept;
+    }
+    let device = device::first_adopted().unwrap_or_else(|| {
+        let made = made_devices(sel, || {
+            rt::Device::system_default_with(device_options()).map(|d| vec![d])
         });
-    }
-    level
-}
-
-/// The Metal level every device of this process answers at (`rt::DeviceProperties::metal_level`):
-/// the macOS release whose Metal the runtime answers as where releases differ, among them which
-/// pixel format values a texture descriptor takes ([`rt::MetalLevel::knows`]) and which formats
-/// Metal describes ([`rt::MetalLevel::describes`]). [`device_options`] names the OS's
-/// ([`crate::os::METAL_LEVEL`]): on macOS none, so it is the host's release, or the newest
-/// measured release below it; on Linux macOS 27.0.1, the contract machine's. The same for every
-/// device. The first device the platform adopts sets it ([`answered_at`]); read before any is,
-/// it is the runtime's system default device's, made for it, which dies as [`made_devices`]
-/// does where the runtime makes none, at `sel`, the call that asks.
-pub(crate) fn metal_level(sel: &'static str) -> rt::MetalLevel {
-    if let Some(&level) = METAL_LEVEL.get() {
-        return level;
-    }
-    let made = made_devices(sel, || {
-        rt::Device::system_default_with(device_options()).map(|d| vec![d])
+        made.into_iter()
+            .next()
+            .unwrap_or_else(|| refused(sel, &rt::Error::NoDevice))
     });
-    let Some(device) = made.first() else {
-        refused(sel, &rt::Error::NoDevice)
-    };
-    let level = device.properties().metal_level;
-    answered_at(sel, level);
-    level
-}
-
-/// The level of [`metal_level`], once known.
-static METAL_LEVEL: std::sync::OnceLock<rt::MetalLevel> = std::sync::OnceLock::new();
-
-/// Keeps `level`, a device's, as the process's Metal level ([`metal_level`]), and logs it the
-/// first time. A device of another level than the process's answers as its own, relayed at
-/// `sel`, the call that made it, and dies there in strict mode
-/// ([`crate::answer::Inexact::MetalLevel`]; unreachable: every device here is made with
-/// [`device_options`]).
-pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
-    let kept = *METAL_LEVEL.get_or_init(|| {
-        log::info!(
-            target: "reims_vgpu_vulkan::platform",
-            "the Vulkan runtime's devices answer Metal's pixel formats as {level}"
-        );
-        level
-    });
-    if kept != level {
-        crate::answer::inexact(sel, crate::answer::Inexact::MetalLevel, || {
-            format!(
-                "a device answering Metal as {level}, where this process's devices answer as {kept}"
-            )
-        });
-    }
+    DEVICE.get_or_init(|| device)
 }
 
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
-/// OS's Metal level ([`crate::os::METAL_LEVEL`]: on Linux macOS 27.0.1, the contract machine's,
-/// where the runtime's default off macOS is its newest measured release), the shader cache in
+/// shader cache in
 /// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
 /// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], a command buffer's
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
@@ -356,7 +288,6 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
     static OPTIONS: LazyLock<rt::DeviceOptions> = LazyLock::new(|| {
         let mut options = rt::DeviceOptions::default();
         crate::os::add_window_extensions(&mut options);
-        options.metal_level = crate::os::METAL_LEVEL;
         options.gpu_times_from_host = true;
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
         let sink = rt::MessageSink::new(crate::answer::notice);
@@ -383,59 +314,23 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 }
 
 /// The fields of the runtime's device policy (`metal2vulkan::device::DevicePolicy`) whose exact
-/// form `REIMS_VGPU_EXACT` can name, each by the field's own name: Metal's sampler emulated
-/// (`sampling`, `SamplingPolicy::Exact`), Metal's filter of a two-plane YCbCr texture under
-/// native sampling, in a pipeline the draw binding one makes (`ycbcr_filter`,
-/// `YCbCrFilterPolicy::Exact`), the translation's routines for the maths functions,
-/// divisions and fused multiply-adds Metal answers beyond Vulkan's precision table
-/// (`float_maths`, `FloatMathsPolicy::Exact`), Metal's texel conversion (`texel_conversion`,
-/// `TexelConversionPolicy::Exact`: every read's, and a sample's or gather's with `sampling`),
-/// Metal's conversion of a normalized vertex attribute, computed in the shader from the
-/// attribute's codes (`vertex_normalized`, `VertexNormalizedPolicy::Exact`), Metal's `half` rounding (`half_rounding`, `HalfRoundingPolicy::Exact`), Metal's NaN bits and
-/// the operand its minimum and maximum functions pick at a NaN or a signed zero
-/// (`nan_and_min_max`, `NanMinMaxPolicy::Exact`), Metal's rounding order of `dot`, `mix` and
-/// `fast::sqrt` (`rounding_order`, `RoundingOrderPolicy::Exact`), Metal's `half` blend of a
-/// safe-math `half4` output into a 16-bit float attachment, which the function computes
-/// (`half_blend`, `HalfBlendPolicy::Exact`), a 16-bit float texel's own bits at a read, through
-/// the texture's unsigned-integer alias, where the device's decode would answer its own NaN
-/// (`half_texel_bits`, `HalfTexelBitsPolicy::Exact`), a multisampled `Depth32Float` texture the
-/// program only reads held in a colour image, which keeps every `float` a fill or a sample copy
-/// writes, on a device whose depth images may not (`multisample_depth_twin`,
-/// `MultisampleDepthTwinPolicy::Exact`), Metal's values in the decoded twin of a texture
-/// whose format the device lacks, an ASTC LDR or EAC 11-bit one (`decoded_texels`,
-/// `DecodedTexelsPolicy::Exact`), Metal's tile store of a loaded signed normalized or
-/// `RGB9E5Float` colour attachment (`tile_store`, `TileStorePolicy::Exact`), Metal's resolve of a
-/// multisampled colour attachment (`resolve`, `ResolvePolicy::Exact`), and each batch of a queue
-/// ordered after the earlier ones by the accesses it depends on (`batch_order`,
-/// `BatchOrderPolicy::Exact`), and a shadow, copied in before each use and merged back after
-/// each write, for every texture over the guest's pages where a texture that only samples or
-/// reads them would be a linear image in place on a driver whose own first-move check passes
-/// (`host_page_textures`, `HostPageTexturePolicy::Shadow`). [`EXACT_ALL`] names every one but
-/// `sampling`. The policy's
-/// `completion` and `heap_compression` are no names of these: every device takes their exact
-/// forms ([`exact_policy`]).
-pub const EXACT_FORMS: [&str; 16] = [
-    "sampling",
-    "ycbcr_filter",
-    "float_maths",
-    "texel_conversion",
-    "vertex_normalized",
-    "half_rounding",
-    "nan_and_min_max",
-    "rounding_order",
-    "half_blend",
-    "half_texel_bits",
-    "multisample_depth_twin",
-    "decoded_texels",
-    "tile_store",
-    "resolve",
-    "batch_order",
-    "host_page_textures",
-];
+/// form `REIMS_VGPU_EXACT` can name, each by the field's own name: each batch of a queue ordered
+/// after the earlier ones by the accesses it depends on (`batch_order`,
+/// `BatchOrderPolicy::Exact`), a shadow, copied in before each use and merged back after each
+/// write, for every texture over the guest's pages where a texture that only samples or reads
+/// them would be a linear image in place on a driver whose own first-move check passes
+/// (`host_page_textures`, `HostPageTexturePolicy::Shadow`), and, on a device without
+/// `shaderFloat16`, each `half` addition, subtraction and product of a fast-math chain rounded
+/// where it is computed, where the default rounds the chain where a value leaves it
+/// (`half_chains`, `HalfChainPolicy::EachOperation`). [`EXACT_ALL`] names every one. The
+/// policy's `completion` and `heap_compression` are no names of these: every device takes their
+/// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
+/// device's own arithmetic, sampling and conversions, each difference a precision note it
+/// records, with no exact form to name.
+pub const EXACT_FORMS: [&str; 3] = ["batch_order", "host_page_textures", "half_chains"];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
-/// field of [`EXACT_FORMS`] but `sampling` in its exact form, as the runtime's validation sets
-/// them. `sampling` may be named beside it.
+/// field of [`EXACT_FORMS`] in its exact form, as the runtime's validation sets them.
 pub const EXACT_ALL: &str = "all";
 
 /// The device policy every device is made with: the runtime's default, whose native forms are
@@ -457,26 +352,15 @@ pub const EXACT_ALL: &str = "all";
 /// 0x10000 for a 64x64 `BGRA8Unorm` texture, where the uncompressed one answers 0x4080 at 0x1000,
 /// and Metal 0x4080 at 0x80), and a write through a buffer or texture over its bytes may not show
 /// in its texels. Each field of [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated
-/// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form but
-/// `sampling`'s: larger modules and longer pipeline creation, `ycbcr_filter`'s pipeline made at a
-/// draw, `vertex_normalized`'s module for each normalized vertex format, `half_texel_bits`' second view and descriptor at a read slot, `decoded_texels`' larger
-/// twins, `tile_store`'s load pass before a pass, `resolve`'s render pass instance after one,
-/// `batch_order`'s barriers between batches, and `host_page_textures`' copies of each sampled
-/// texture over the guest's pages at each command buffer's first use. A device that runs on Metal (MoltenVK) answers as
-/// Metal under either, but for the NaN a `half` read, sample or gather hands back for a NaN texel,
-/// Metal's only under `nan_and_min_max` and, for a read of a 16-bit float texture, whose NaN the
-/// device's decode answers as `0x7e00` (the runtime's measurement on the M3 Max), only under
-/// `half_texel_bits`, and a linear sample of a two-plane YCbCr texture, which Metal's own sampler
-/// filters by default (within one step of the format's grid, announced) and Metal's filter of the
-/// format only under `ycbcr_filter`. A name of neither changes nothing, and a line on stderr says
-/// so.
+/// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form:
+/// `batch_order`'s barriers between batches, `host_page_textures`' copies of each sampled texture
+/// over the guest's pages at each command buffer's first use, and `half_chains`' rounding at
+/// each `half` operation on a device without `shaderFloat16`. A name of neither changes nothing,
+/// and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
-        BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
-        HalfBlendPolicy, HalfRoundingPolicy, HalfTexelBitsPolicy, HeapCompressionPolicy,
-        HostPageTexturePolicy, MultisampleDepthTwinPolicy, NanMinMaxPolicy, ResolvePolicy,
-        RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
-        VertexNormalizedPolicy, YCbCrFilterPolicy,
+        BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy, HeapCompressionPolicy,
+        HostPageTexturePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -484,24 +368,9 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     for name in (exact.unwrap_or_default().split(',').map(str::trim)).filter(|n| !n.is_empty()) {
         match name {
             EXACT_ALL => policy = policy.exact_answers(),
-            "sampling" => policy.sampling = SamplingPolicy::Exact,
-            "ycbcr_filter" => policy.ycbcr_filter = YCbCrFilterPolicy::Exact,
-            "float_maths" => policy.float_maths = FloatMathsPolicy::Exact,
-            "texel_conversion" => policy.texel_conversion = TexelConversionPolicy::Exact,
-            "vertex_normalized" => policy.vertex_normalized = VertexNormalizedPolicy::Exact,
-            "half_rounding" => policy.half_rounding = HalfRoundingPolicy::Exact,
-            "nan_and_min_max" => policy.nan_and_min_max = NanMinMaxPolicy::Exact,
-            "rounding_order" => policy.rounding_order = RoundingOrderPolicy::Exact,
-            "half_blend" => policy.half_blend = HalfBlendPolicy::Exact,
-            "half_texel_bits" => policy.half_texel_bits = HalfTexelBitsPolicy::Exact,
-            "multisample_depth_twin" => {
-                policy.multisample_depth_twin = MultisampleDepthTwinPolicy::Exact;
-            }
-            "decoded_texels" => policy.decoded_texels = DecodedTexelsPolicy::Exact,
-            "tile_store" => policy.tile_store = TileStorePolicy::Exact,
-            "resolve" => policy.resolve = ResolvePolicy::Exact,
             "batch_order" => policy.batch_order = BatchOrderPolicy::Exact,
             "host_page_textures" => policy.host_page_textures = HostPageTexturePolicy::Shadow,
+            "half_chains" => policy.half_chains = HalfChainPolicy::EachOperation,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -798,17 +667,14 @@ pub(crate) mod tests {
     /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms,
     /// but for its exact completion and uncompressed heap textures, which every device takes and
     /// no name selects; each name of `EXACT_FORMS` takes that field's exact form alone, in any
-    /// order, spaces around a name ignored; `all` takes the runtime's `exact_answers()`, every one
-    /// but `sampling`; another name, `completion` and `heap_compression` among them, changes
+    /// order, spaces around a name ignored; `all` takes the runtime's `exact_answers()`, every
+    /// one; another name, `completion`, `heap_compression` and `sampling` among them, changes
     /// nothing
     #[test]
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
-            BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy,
-            FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, HalfTexelBitsPolicy,
-            HeapCompressionPolicy, HostPageTexturePolicy, MultisampleDepthTwinPolicy,
-            NanMinMaxPolicy, ResolvePolicy, RoundingOrderPolicy, SamplingPolicy,
-            TexelConversionPolicy, TileStorePolicy, VertexNormalizedPolicy, YCbCrFilterPolicy,
+            BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy,
+            HeapCompressionPolicy, HostPageTexturePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -816,25 +682,9 @@ pub(crate) mod tests {
         let mut fast = runtimes;
         fast.completion = CompletionPolicy::Exact;
         fast.heap_compression = HeapCompressionPolicy::Uncompressed;
-        assert_eq!(fast.sampling, SamplingPolicy::NativeDevice);
-        assert_eq!(fast.ycbcr_filter, YCbCrFilterPolicy::Device);
-        assert_eq!(fast.float_maths, FloatMathsPolicy::Native);
-        assert_eq!(fast.texel_conversion, TexelConversionPolicy::Device);
-        assert_eq!(fast.vertex_normalized, VertexNormalizedPolicy::Device);
-        assert_eq!(fast.half_rounding, HalfRoundingPolicy::Native);
-        assert_eq!(fast.nan_and_min_max, NanMinMaxPolicy::Native);
-        assert_eq!(fast.rounding_order, RoundingOrderPolicy::Native);
-        assert_eq!(fast.half_blend, HalfBlendPolicy::Device);
-        assert_eq!(fast.half_texel_bits, HalfTexelBitsPolicy::Device);
-        assert_eq!(
-            fast.multisample_depth_twin,
-            MultisampleDepthTwinPolicy::Device
-        );
-        assert_eq!(fast.decoded_texels, DecodedTexelsPolicy::Compact);
-        assert_eq!(fast.tile_store, TileStorePolicy::Device);
-        assert_eq!(fast.resolve, ResolvePolicy::Device);
         assert_eq!(fast.batch_order, BatchOrderPolicy::Ends);
         assert_eq!(fast.host_page_textures, HostPageTexturePolicy::InPlace);
+        assert_eq!(fast.half_chains, HalfChainPolicy::AtExits);
         for unchanged in [
             None,
             Some(""),
@@ -843,47 +693,19 @@ pub(crate) mod tests {
             Some("padded_reads"),
             Some("completion"),
             Some("heap_compression"),
+            Some("sampling"),
         ] {
             assert_eq!(exact_policy(unchanged), fast, "{unchanged:?}");
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 16] = [
-            ("sampling", |p| p.sampling = SamplingPolicy::Exact),
-            ("ycbcr_filter", |p| {
-                p.ycbcr_filter = YCbCrFilterPolicy::Exact
-            }),
-            ("float_maths", |p| p.float_maths = FloatMathsPolicy::Exact),
-            ("texel_conversion", |p| {
-                p.texel_conversion = TexelConversionPolicy::Exact;
-            }),
-            ("vertex_normalized", |p| {
-                p.vertex_normalized = VertexNormalizedPolicy::Exact;
-            }),
-            ("half_rounding", |p| {
-                p.half_rounding = HalfRoundingPolicy::Exact
-            }),
-            ("nan_and_min_max", |p| {
-                p.nan_and_min_max = NanMinMaxPolicy::Exact
-            }),
-            ("rounding_order", |p| {
-                p.rounding_order = RoundingOrderPolicy::Exact
-            }),
-            ("half_blend", |p| p.half_blend = HalfBlendPolicy::Exact),
-            ("half_texel_bits", |p| {
-                p.half_texel_bits = HalfTexelBitsPolicy::Exact
-            }),
-            ("multisample_depth_twin", |p| {
-                p.multisample_depth_twin = MultisampleDepthTwinPolicy::Exact
-            }),
-            ("decoded_texels", |p| {
-                p.decoded_texels = DecodedTexelsPolicy::Exact
-            }),
-            ("tile_store", |p| p.tile_store = TileStorePolicy::Exact),
-            ("resolve", |p| p.resolve = ResolvePolicy::Exact),
+        let alone: [(&str, Set); 3] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
             ("host_page_textures", |p| {
                 p.host_page_textures = HostPageTexturePolicy::Shadow;
+            }),
+            ("half_chains", |p| {
+                p.half_chains = HalfChainPolicy::EachOperation;
             }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
@@ -895,20 +717,11 @@ pub(crate) mod tests {
             assert_eq!(one(name), want, "{name}");
             set(&mut every);
         }
-        let named = " half_blend,half_rounding,sampling , rounding_order,texel_conversion,\
-                     nan_and_min_max,batch_order, resolve,float_maths,ycbcr_filter,\
-                     multisample_depth_twin,tile_store,decoded_texels, half_texel_bits,\
-                     vertex_normalized, host_page_textures";
+        let named = " half_chains,host_page_textures , batch_order";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
-        let answers = fast.exact_answers();
-        assert_eq!(one(EXACT_ALL), answers);
-        assert_eq!(answers.sampling, SamplingPolicy::NativeDevice);
-        let mut but_sampling = every;
-        but_sampling.sampling = SamplingPolicy::NativeDevice;
-        assert_eq!(answers, but_sampling);
-        assert_eq!(exact_policy(Some("sampling, all")), every);
-        assert_eq!(exact_policy(Some("all,sampling")), every);
+        assert_eq!(one(EXACT_ALL), fast.exact_answers());
+        assert_eq!(fast.exact_answers(), every);
     }
 
     /// Obj: clone_ref() is another reference to the same object, and the last drop releases it
@@ -953,107 +766,18 @@ pub(crate) mod tests {
     }
 
     /// A device creator dies at its selector where the runtime refuses its devices otherwise than
-    /// for having none, naming the refusal: a macOS host below every release whose Metal the
-    /// runtime measured among them (`Problem::HostReleaseUnmeasured`); with no device or no
-    /// loader it makes none
+    /// for having none, naming the refusal; with no device or no loader it makes none
     #[test]
-    fn a_host_whose_metal_the_runtime_cannot_answer_dies_at_the_creator() {
+    fn a_refused_device_dies_at_the_creator() {
         use reims_vgpu_core::raise::death::DeathKind;
         use reims_vgpu_core::testkit::capture::catch_death;
         for sel in ["MTLCreateSystemDefaultDevice()", "MTLCopyAllDevices()"] {
-            let unmeasured = rt::Error::Unproven(rt::Unproven::new(
-                "all_with",
-                rt::Problem::HostReleaseUnmeasured {
-                    macos: Some([15, 6, 1]),
-                },
-            ));
+            let refusal = rt::Error::NotImplemented(rt::RuntimeGap::Textures);
             *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(|| made_devices(sel, || Err(unmeasured))).unwrap_err();
+            let site = catch_death(|| made_devices(sel, || Err(refusal))).unwrap_err();
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
             assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-            assert!(line.contains("HostReleaseUnmeasured"), "{line}");
             assert!(made_devices(sel, || Err(rt::Error::NoDevice)).is_empty());
-        }
-    }
-
-    /// On a host whose macOS release the runtime has not measured, above one it has, the device
-    /// is made, at the newest measured release below the host's (`MetalLevelBelowHost`, kept by
-    /// `made_devices`, here set by hand, as this host's release is measured). An answer the
-    /// measured releases give otherwise dies where it is asked, naming it: the setter's at a
-    /// three-channel format (45, `RGB8Unorm`) and 586's description, whose flags differ. Every
-    /// other answer is the level's, with no death: the setter's at 80 and 630, a view in 81, a
-    /// shared texture of 80, and 80's description, whose cast class differs, which core does not
-    /// read, and a level's layout of it; and at 630, which no level describes, a view's nil, a
-    /// shared texture's nil at `Private` storage, its description and a level's layout of it. The
-    /// release is set back to a measured one as the test ends, whether it passes or not
-    #[test]
-    fn an_unmeasured_release_dies_only_where_an_answer_depends_on_it() {
-        use crate::gpu::format_info::setter_takes;
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::resource::Texture as _;
-        use reims_vgpu_core::raise::death::DeathKind;
-        use reims_vgpu_core::testkit::capture::catch_death;
-        /// Sets the release back to a measured one when dropped.
-        struct Measured;
-        impl Drop for Measured {
-            fn drop(&mut self) {
-                BELOW_HOST.store(false, Ordering::Relaxed);
-            }
-        }
-        let d = dev();
-        let _measured = Measured;
-        BELOW_HOST.store(true, Ordering::Relaxed);
-        let p = platform();
-        let desc = |pixel_format, resource_options| {
-            p.texture_descriptor(&TextureDesc {
-                pixel_format,
-                width: 4,
-                height: 4,
-                usage: 1,
-                resource_options: Some(resource_options),
-                ..TextureDesc::default()
-            })
-        };
-        assert!(setter_takes("setPixelFormat:", 80));
-        assert!(setter_takes("setPixelFormat:", 630));
-        let t = d
-            .new_texture(OnFault::Return, &desc(80, 0))
-            .unwrap()
-            .unwrap();
-        assert!(t.new_texture_view(81).unwrap().is_some());
-        assert!(d.new_shared_texture(&desc(80, 0x20)).unwrap().is_some());
-        let level = |pixel_format| reims_vgpu_core::platform::types::TextureLevelQuery {
-            pixel_format,
-            width: 4,
-            height: 4,
-            depth: 1,
-            array_length: 1,
-            options: 0,
-            flags: 0,
-        };
-        assert_eq!(d.pixel_format_info(80).block_bytes, 4);
-        assert_eq!(d.texture_level_info(&level(80)).bytes_per_row, 16);
-        assert!(t.new_texture_view(630).unwrap().is_none());
-        assert!(d.new_shared_texture(&desc(630, 0x20)).unwrap().is_none());
-        assert_eq!(d.pixel_format_info(630).flags, 0);
-        d.texture_level_info(&level(630));
-        let cases: [(&str, &dyn Fn()); 2] = [
-            ("setPixelFormat:", &|| {
-                setter_takes("setPixelFormat:", 45);
-            }),
-            ("MTLPixelFormatGetInfoForDevice()", &|| {
-                d.pixel_format_info(586);
-            }),
-        ];
-        for (sel, ask) in cases {
-            *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(ask).unwrap_err();
-            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-            assert!(
-                line.contains("not one the Vulkan runtime measured"),
-                "{line}"
-            );
         }
     }
 

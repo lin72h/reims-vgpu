@@ -1146,9 +1146,8 @@ mod tests {
         (site.file, line)
     }
 
-    /// Any depth-stencil value is a state; below Apple10 its resource ID is plain Metal's at the
-    /// device's level, 0 at macOS 27.0.1 and a raise at 26.7, and its resource index raises at
-    /// both, as Metal's do on the M3 Max (the Metal platform's
+    /// Any depth-stencil value is a state; below Apple10 its resource ID is plain Metal's, 0, and
+    /// its resource index raises, as Metal's do on the M3 Max (the Metal platform's
     /// `depth_stencil_state_getters_raise`)
     #[test]
     fn depth_stencil_states_are_made_and_their_ids_raise() {
@@ -1170,10 +1169,7 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        match d.raw.properties().metal_level {
-            rt::MetalLevel::MacOS26_7 => assert!(s.gpu_resource_id().is_err()),
-            _ => assert!(matches!(s.gpu_resource_id(), Ok(0))),
-        }
+        assert!(matches!(s.gpu_resource_id(), Ok(0)));
         let raised = s.resource_index().unwrap_err();
         assert_eq!(raised.site().file, "resourceIndex");
         let site = catch_death(|| {

@@ -335,8 +335,7 @@ impl TextureObject {
             );
         }
         let pf = plain(|| raw.pixel_format());
-        let what = "a CPU write of a texture on a surface made read-only for the GPU, of";
-        let block = crate::gpu::format_info::block(sel, u64::from(pf.as_raw()), what);
+        let block = crate::gpu::format_info::block(sel, u64::from(pf.as_raw()));
         if block.compressed() {
             unrepresentable(
                 sel,
@@ -1246,12 +1245,6 @@ fn indices(sel: &'static str, r: NsRange) -> std::ops::Range<u64> {
 /// value Metal describes no format for ([`crate::gpu::format_info::described`]) but 255 and 262,
 /// `MTLPixelFormatInvalid`'s 0 among them (measured: `views_metal_answers_nil_are_nil`). Before
 /// anything else of the view is checked, as Metal's: its swizzle, type, levels and slices.
-///
-/// That was measured at macOS 26.7. A view in a value the releases the runtime measured describe
-/// otherwise (no value at the runtime's levels: [`crate::gpu::format_info::level_decides`])
-/// is answered by the level's description at any other level, relayed at `sel`, as nothing
-/// measured whether Metal makes it there, and dies in strict mode
-/// ([`crate::answer::Inexact::MetalLevel`]).
 fn no_view(sel: &'static str, pixel_format: u64) -> bool {
     if plain(|| crate::gpu::no_texture::no_view(pixel_format)) {
         return true;
@@ -1259,22 +1252,7 @@ fn no_view(sel: &'static str, pixel_format: u64) -> bool {
     if matches!(pixel_format, 255 | 262) {
         return false;
     }
-    let described = crate::gpu::format_info::describes_answer(sel, pixel_format);
-    let level = crate::platform::metal_level(sel);
-    if crate::gpu::format_info::level_decides(pixel_format) && level != rt::MetalLevel::MacOS26_7 {
-        crate::answer::inexact(sel, crate::answer::Inexact::MetalLevel, || {
-            format!(
-                "a view in pixel format {pixel_format}, which Metal at {level} describes \
-                 {}: whether Metal makes such a view was measured at macOS 26.7 alone",
-                if described {
-                    "a format for"
-                } else {
-                    "no format for"
-                }
-            )
-        });
-    }
-    !described
+    !crate::gpu::format_info::described(sel, pixel_format)
 }
 
 /// The runtime's format of a view in `raw`, which `sel` makes, a value [`no_view`] is not nil in:
@@ -1762,7 +1740,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// compressed, whose image the runtime keeps apart from the heap's bytes over the guest's
     /// pages (`heap-texture-lossless-layout`), dies as it is made ([`crate::answer::HEARD`]). So
     /// does, as it is placed or answered nil, a texture whose layout in Metal's heaps the runtime
-    /// does not model (a PVRTC format at Metal level 26.7), placed by
+    /// does not model, placed by
     /// its device's image's size and alignment, larger or smaller than Metal's
     /// (`unmeasured-heap-texture-size`, [`crate::gpu::metal_space::unmeasured_size`]): no suite
     /// case or guest run places one. Its nil at an offset at or past the heap's end is Metal's,
@@ -1923,9 +1901,8 @@ impl SamplerState for VulkanSamplerState {
 
 /// The getters below Apple10 are the host's stubs' (the Metal platform's
 /// `depth_stencil_state_getters_raise`, measured on the M3 Max): `gpuResourceID` is the runtime's,
-/// what plain Metal answers at the device's Metal level, 0 at macOS 27.0.1 and a raise at 26.7,
-/// the caller's to catch; `resourceIndex` raises at both, and the runtime has no index of its
-/// own. So the guest's info request, which reads both, raises at either level, as on Metal.
+/// what plain Metal answers, 0; `resourceIndex` raises, and the runtime has no index of its own.
+/// So the guest's info request, which reads both, raises, as on Metal.
 impl DepthStencilState for VulkanDepthStencilState {
     fn gpu_resource_id(&self) -> RaiseResult<u64> {
         send("gpuResourceID", Policy::Caught, || {
@@ -3925,10 +3902,7 @@ pub(crate) mod tests {
 
     /// A texture of a plain format of `ShaderWrite` usage placed in a heap over the guest's pages
     /// is made, and so are one of `BC1_RGBA` and one of a PVRTC format (`PVRTC_RGBA_4BPP`), of
-    /// `ShaderRead` usage, whose blocks lie in Metal's tiles at every level the runtime measured:
-    /// PVRTC's at macOS 27.0.1, the Mac's and Linux's level here. At 26.7, where the runtime lays
-    /// a PVRTC texture's blocks out as its own, it announces `heap-texture-block-compressed-layout`
-    /// ([`crate::answer::DIES`])
+    /// `ShaderRead` usage, whose blocks lie in Metal's tiles at every level
     #[test]
     fn heap_textures_over_guest_pages_in_metals_block_layout_are_made() {
         use reims_vgpu_core::platform::types::ResourceAddressRange;

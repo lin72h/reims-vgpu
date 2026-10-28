@@ -135,23 +135,9 @@ pub(crate) fn runtime_pixel_format(raw: u64) -> Option<PixelFormat> {
 /// has no format of it or Metal describes none for it (`Depth24Unorm_Stencil8` and `X24_Stencil8`,
 /// which the runtime has), but `MTLPixelFormatInvalid`: a texture or a state of a raw value dies
 /// where it is made, or is nil, as Metal's ([`crate::gpu::desc::lacked`],
-/// [`crate::gpu::serialized::RawFormat`]). Where the releases the runtime measured describe `raw`
-/// otherwise (no value at the runtime's levels, which describe the same formats), what `sel` makes
-/// of it depends on the release, so on a host whose
-/// release the runtime has not measured `sel` dies there, naming the level
-/// ([`crate::gpu::format_info::describes_answer`]).
+/// [`crate::gpu::serialized::RawFormat`]). `sel` asks Metal's description
+/// ([`crate::gpu::format_info::described`]).
 pub(crate) fn held_format(sel: &'static str, raw: u64) -> Result<PixelFormat, u64> {
-    held_by(raw, |raw| {
-        crate::gpu::format_info::describes_answer(sel, raw)
-    })
-}
-
-/// [`held_format`] as a descriptor's setter (`sel`) holds `raw`, which never dies: the setter
-/// answers alike at every release, and holds the value as the devices' level describes it
-/// ([`crate::gpu::format_info::described`]), which only decides how the descriptor keeps it,
-/// as its pixel format answers the same value either way. A texture of it asks the level where
-/// it is made ([`crate::gpu::desc::TextureFields::descriptor`]).
-pub(crate) fn set_format(sel: &'static str, raw: u64) -> Result<PixelFormat, u64> {
     held_by(raw, |raw| crate::gpu::format_info::described(sel, raw))
 }
 

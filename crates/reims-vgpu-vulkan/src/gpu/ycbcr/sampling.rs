@@ -2,7 +2,6 @@
 //! Metal's ([`super::runtime_makes`]): what they read and sample, their IDs and usage, their
 //! views, where the runtime cannot map their samplers, and what they show of writes of their
 //! surfaces. The harness is [`super::measure`]'s.
-use metal2vulkan::device::YCbCrFilterPolicy;
 use metal2vulkan::metal::PixelFormat;
 use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
 use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
@@ -27,7 +26,7 @@ use super::measure::{
 };
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::device::tests::dev;
-use crate::gpu::device::tests::metal_tests::{NoLauncher, device_with_ycbcr_filter};
+use crate::gpu::device::tests::metal_tests::NoLauncher;
 use crate::gpu::resource::{VulkanComputePipeline, VulkanTexture};
 use crate::os::{MATRIX_KEY, OsSurface};
 use crate::platform::VulkanPlatform;
@@ -63,14 +62,11 @@ fn ours_on(d: &VulkanDevice, format: u64, surface: &OsSurface, size: (u64, u64))
         .unwrap()
 }
 
-/// The device whose samples of the family the comparisons with Metal's read: the runtime's
-/// exact filter of the format (`ycbcr_filter: YCbCrFilterPolicy::Exact`, the form
-/// `REIMS_VGPU_EXACT=ycbcr_filter` takes), on a device of its own
-/// ([`device_with_ycbcr_filter`]). The default filters such a texture as Metal's own sampler
-/// filters its converted texels, within the bound
-/// [`the_default_filter_samples_within_its_bound_of_metals`] checks.
+/// The device whose samples of the family the comparisons with Metal's read: the platform's
+/// own ([`dev`]). Its linear samples are Metal's own sampler's filter of the converted texels,
+/// within the bound [`the_default_filter_samples_within_its_bound_of_metals`] checks.
 fn exact() -> VulkanDevice {
-    device_with_ycbcr_filter(YCbCrFilterPolicy::Exact)
+    dev()
 }
 
 /// The two-plane OSTypes a texture of the family is made over: 8-bit, 10-bit and packed
@@ -963,9 +959,8 @@ fn samples_under_every_mode_as_metals(format: u64, ostypes: [&[u8; 4]; 2]) {
     }
 }
 
-/// Under the runtime's default filter of a two-plane YCbCr texture on this host (MoltenVK,
-/// `ycbcr_filter: YCbCrFilterPolicy::Device`, on a device of its own whatever `REIMS_VGPU_EXACT`
-/// names, [`device_with_ycbcr_filter`]), Metal's own sampler filters the texture's converted
+/// Under the runtime's filter of a two-plane YCbCr texture on this host (MoltenVK, the
+/// platform's own device, [`dev`]), Metal's own sampler filters the texture's converted
 /// texels, which hold Metal's reads exactly, at Metal's weights but without the format's
 /// truncated sum on its grid. A linear sample of a texture of `YCBCR8_420_2P` (500) and of its
 /// `_sRGB` twin (520) over a '420v' surface, at positions a third of a texel apart from 0.9 of a
@@ -1005,7 +1000,7 @@ fn the_default_filter_samples_within_its_bound_of_metals() {
             -magnitude
         }
     };
-    let d = device_with_ycbcr_filter(YCbCrFilterPolicy::Device);
+    let d = dev();
     let size = (40, 24);
     let grid = ((size.0 + 2) * 3, (size.1 + 2) * 3);
     let bytes = probe((-0.9, -0.9), 1.0 / 3.0, grid, true, 0);

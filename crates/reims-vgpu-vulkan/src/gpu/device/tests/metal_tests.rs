@@ -251,10 +251,7 @@ fn linear_samples<P: reims_vgpu_core::platform::Platform>(
 /// A `YCBCR8_420_2P` texture over plane 0 of a '420v' or a '420f' surface, of no YCbCr matrix,
 /// BT.601, BT.709, BT.2020 or SMPTE 240M, reads each texel as Metal's does, by `read()` into
 /// floats and by a nearest sample at each texel's centre, each compared with Metal's own, odd
-/// sizes included: the runtime's, over the surface's facts ([`crate::os::ycbcr_facts`]). Under
-/// the runtime's exact filter of the format (`ycbcr_filter: YCbCrFilterPolicy::Exact`, on a
-/// device of its own, [`device_with_ycbcr_filter`]; the default's samples are
-/// `ycbcr::sampling`'s `the_default_filter_samples_within_its_bound_of_metals`), its
+/// sizes included: the runtime's, over the surface's facts ([`crate::os::ycbcr_facts`]). Its
 /// linear samples between the texels in a kernel are Metal's, bit for bit
 /// ([`linear_samples`]): magnified, into halves and into floats, in texels and normalized,
 /// through a runtime sampler with a linear mip filter or none, which the runtime announces
@@ -277,7 +274,7 @@ fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
     };
     use crate::os::MATRIX_KEY;
     use reims_vgpu_metal::MetalPlatform;
-    let d = device_with_ycbcr_filter(metal2vulkan::device::YCbCrFilterPolicy::Exact);
+    let d = dev();
     let p = crate::platform::tests::platform();
     let mp = MetalPlatform::new(Box::new(NoLauncher));
     for (ostype, size) in [(b"420v", (33, 17)), (b"420f", (64, 32))] {
@@ -1343,9 +1340,8 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
 /// shared creator, which answers nil at either storage, as Metal does (measured at macOS 26.7
 /// and 27.0.1). Any other value dies at `setPixelFormat:`, where Metal asserts
 /// ("MTLDebugValidateMTLPixelFormat:1622: failed assertion `pixelFormat (2000) is not a valid
-/// MTLPixelFormat.'"), at macOS 26.7 45 to 48, 95 to 100 and 120 to 122 among them, the
-/// three-channel formats of a later SDK, which macOS 27.0.1's setter takes and describes no
-/// format for (the runtime's level). Metal's assertions were measured one case a
+/// MTLPixelFormat.'"); the three-channel formats, 45 to 48, 95 to 100 and 120 to 122, Metal's
+/// setter takes and describes no format for. Metal's assertions were measured one case a
 /// process, with `MTL_DEBUG_LAYER` unset; the setter's the same under it. Under
 /// `MTL_DEBUG_LAYER`, `newSharedTextureWithDescriptor:` at `Shared` storage asserts
 /// ("-[MTLDebugDevice newSharedTextureWithDescriptor:]:553") rather than answering nil.
@@ -1565,7 +1561,7 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
         }
     }
     for format in [2, 45, 48, 95, 100, 120, 122, 653, 2000] {
-        if crate::gpu::format_info::setter_takes("setPixelFormat:", format) {
+        if crate::gpu::format_info::setter_takes(format) {
             let held = p.texture_descriptor(&desc(format, 2));
             assert_eq!(held.pixel_format(), format, "the setter's");
             continue;
@@ -2407,8 +2403,8 @@ fn invalid_formats_are_metals() {
 
 /// `setPixelFormat:` takes and answers what Metal's takes, every value from 0 to 2047 tried:
 /// the values of [`crate::gpu::format_info::setter_takes`], which Metal's setter takes and
-/// answers too, compared on the host, 288 at macOS 26.7 and 301 at 27.0.1, which takes the 13
-/// three-channel formats too; every other value dies at the setter, where Metal's asserts
+/// answers too, compared on the host, 301, the 13 three-channel formats among them; every other
+/// value dies at the setter, where Metal's asserts
 /// (measured one value a process with `MTL_DEBUG_LAYER` unset)
 #[test]
 fn the_setter_takes_what_metals_takes() {
@@ -2426,10 +2422,7 @@ fn the_setter_takes_what_metals_takes() {
         match catch_death(|| ours.set_pixel_format(raw)) {
             Ok(()) => {
                 taken += 1;
-                assert!(
-                    crate::gpu::format_info::setter_takes("setPixelFormat:", raw),
-                    "{raw}"
-                );
+                assert!(crate::gpu::format_info::setter_takes(raw), "{raw}");
                 assert_eq!(ours.pixel_format(), raw);
                 if let Some(metal) = &metal {
                     metal.set_pixel_format(raw);
@@ -2437,10 +2430,7 @@ fn the_setter_takes_what_metals_takes() {
                 }
             }
             Err(site) => {
-                assert!(
-                    !crate::gpu::format_info::setter_takes("setPixelFormat:", raw),
-                    "{raw}"
-                );
+                assert!(!crate::gpu::format_info::setter_takes(raw), "{raw}");
                 assert_eq!(
                     (site.kind, site.file),
                     (DeathKind::Abort, "setPixelFormat:")
@@ -2448,12 +2438,7 @@ fn the_setter_takes_what_metals_takes() {
             }
         }
     }
-    let at_level = match crate::platform::metal_level("setPixelFormat:") {
-        metal2vulkan_runtime::MetalLevel::MacOS26_7 => 288,
-        metal2vulkan_runtime::MetalLevel::MacOS27_0_1 => 301,
-        level => panic!("no count measured at {level}"),
-    };
-    assert_eq!(taken, at_level);
+    assert_eq!(taken, 301);
 }
 
 /// `texture2DDescriptorWithPixelFormat:width:height:mipmapped:` keeps and answers the formats
@@ -2836,7 +2821,7 @@ fn attachment_state<P: reims_vgpu_core::platform::Platform>(
 /// runtime stops alike), 255, 630 and 645 at a tile descriptor's (measured one case
 /// a process:
 /// [`crate::gpu::serialized::RawFormat`]'s docs; 630 to 645 at a render descriptor's colour
-/// attachment, measured on this host again by the runtime for its level of macOS 26.7:
+/// attachment, measured on this host again by the runtime:
 /// `validateWithDevice:` line 5044, "not a valid MTLPixelFormat")
 #[test]
 fn raw_pipeline_formats_die_where_states_are_made() {
@@ -3166,17 +3151,6 @@ pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
         caps: OnceLock::new(),
     });
     (device, OwnCache(dir))
-}
-
-/// A device of the system default's physical device, made with the platform's options but
-/// `filter` as the runtime's filter of a two-plane YCbCr texture (`ycbcr_filter`), whatever
-/// `REIMS_VGPU_EXACT` names ([`super::device_with_policy`]).
-pub(crate) fn device_with_ycbcr_filter(
-    filter: metal2vulkan::device::YCbCrFilterPolicy,
-) -> VulkanDevice {
-    let mut policy = crate::platform::device_options().policy;
-    policy.ycbcr_filter = filter;
-    super::device_with_policy(policy)
 }
 
 /// The directory of [`device_with_own_cache`]'s shader cache, removed as it drops.

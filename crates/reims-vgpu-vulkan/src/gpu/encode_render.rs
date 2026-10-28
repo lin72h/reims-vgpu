@@ -4560,28 +4560,19 @@ pub(crate) mod tests {
     }
 
     /// A pass that resolves `RGBA16Float` and one that resolves `RG11B10Float` (92), each at 4
-    /// samples, in strict mode, on a device under Metal's resolve (`ResolvePolicy::Exact`, the
-    /// form `REIMS_VGPU_EXACT=resolve` takes, on a device of its own,
-    /// [`crate::gpu::device::tests::device_with_policy`]) and on one under the runtime's default
-    /// (`ResolvePolicy::Device`): each ends. Under Metal's resolve the runtime resolves both by
-    /// its own rules of Metal's resolve, or MoltenVK by Metal's own average (the runtime's
-    /// `ColorResolveAverageIsMetals`), and announces no colour resolve the device averages and
-    /// rounds (`DeviceRoundedResolve`); under the default a native device averages and rounds
-    /// them, which it relays ([`crate::answer::native::NATIVE_RELAYED`]), counted, so a strict
-    /// run there goes on past it
+    /// samples, in strict mode, on the platform's device, which resolves by the device's own
+    /// average: each ends. MoltenVK averages as Metal does (the runtime's
+    /// `ColorResolveAverageIsMetals`) and announces no colour resolve the device averages and
+    /// rounds (`DeviceRoundedResolve`); a native device averages and rounds them, which it relays
+    /// ([`crate::answer::native::NATIVE_RELAYED`]), counted, so a strict run there goes on past it
     #[test]
     fn a_device_resolve_ends_its_pass() {
         use crate::answer::native::{self, Placement};
-        use metal2vulkan::device::ResolvePolicy;
 
         /// `MTLTextureType2DMultisample` and `MTLStoreActionMultisampleResolve`.
         const MULTISAMPLE: u64 = 4;
         const RESOLVE: u64 = 2;
         assert!(crate::answer::strict());
-        let mut exact = crate::platform::device_options().policy;
-        exact.resolve = ResolvePolicy::Exact;
-        let mut averaged = exact;
-        averaged.resolve = ResolvePolicy::Device;
         let p = platform();
         let end = |d: &crate::gpu::device::VulkanDevice, format| {
             let samples = d
@@ -4622,17 +4613,14 @@ pub(crate) mod tests {
                 .map_or(0, |(_, n)| n)
         };
         let before = rounded();
-        let d = crate::gpu::device::tests::device_with_policy(exact);
+        let d = dev();
         for format in [RGBA16F, 92] {
             end(&d, format);
         }
-        assert_eq!(rounded(), before);
-        let averaging = crate::gpu::device::tests::device_with_policy(averaged);
-        for format in [RGBA16F, 92] {
-            end(&averaging, format);
-        }
         if native::placement() == Placement::Native {
             assert!(rounded() > before);
+        } else {
+            assert_eq!(rounded(), before);
         }
     }
 

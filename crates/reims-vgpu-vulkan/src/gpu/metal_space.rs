@@ -198,13 +198,11 @@ pub fn texture_allocation(
 }
 
 /// The bytes of a texture of `desc` by Apple's layout ([`texture_allocation`]), for `sel`, the
-/// call that asks, from Metal's description of its format at macOS 26.7, where the layout was
-/// measured: a format another release describes and 26.7 does not dies there
-/// ([`crate::gpu::format_info::block`]).
+/// call that asks, from Metal's description of its format ([`crate::gpu::format_info::block`]).
 fn allocation_of(sel: &'static str, desc: &rt::TextureDescriptor) -> u64 {
     use metal2vulkan::metal::TextureType;
     let raw = u64::from(desc.pixel_format.as_raw());
-    let block = crate::gpu::format_info::block(sel, raw, "Apple's layout of a texture of");
+    let block = crate::gpu::format_info::block(sel, raw);
     let layers = match desc.texture_type {
         TextureType::Cube | TextureType::CubeArray => desc.array_length.max(1).saturating_mul(6),
         _ => desc.array_length,
@@ -246,8 +244,8 @@ pub fn own_memory(
 /// Where the model has none (a format or a sample count whose layout is not measured), of `answer`,
 /// the runtime's answer to the query for `desc`, which the runtime answers as its device's image's,
 /// larger or smaller than Metal's, and announces so (`unmeasured-heap-texture-size`,
-/// [`crate::answer::HEARD`]: a PVRTC format at Metal level 26.7; 8 samples are refused first), at
-/// which a device's texture dies ([`unmeasured_size`]).
+/// [`crate::answer::HEARD`]: 8 samples, which are refused first), at which a device's texture
+/// dies ([`unmeasured_size`]).
 ///
 /// The space takes a range or a slot by that size as for any texture ([`texture_space`]):
 /// `vaprobe depthsizes` took a slot of the size rounded up to [`SLOT_STEP`] in the private pool
@@ -263,11 +261,10 @@ pub fn own_heap_size(
 
 /// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of `what` a
 /// texture of `desc` whose layout in Metal's heaps the runtime does not model, which `sel` heard
-/// the runtime announce (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`]): a PVRTC
-/// format at Metal level 26.7 (8 samples, which its model has no answer for either, its
-/// descriptor check refuses first on every device), whose size and alignment the runtime answers
-/// as its device's image's, larger or smaller than Metal's, and the call goes on with them. The
-/// line names the texture.
+/// the runtime announce (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`]: 8 samples,
+/// which its descriptor check refuses first on every device), whose size and alignment the
+/// runtime answers as its device's image's, larger or smaller than Metal's, and the call goes on
+/// with them. The line names the texture.
 pub fn unmeasured_size(sel: &'static str, what: &str, desc: &rt::TextureDescriptor) {
     crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
         format!(

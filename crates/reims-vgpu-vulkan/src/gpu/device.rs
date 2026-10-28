@@ -233,12 +233,17 @@ static SURFACE_BUFFERS: Mutex<BTreeMap<u64, Vec<Weak<BufferObject>>>> = Mutex::n
 /// counted and no live buffer to share, and die.
 static SURFACE_BUFFER_MAKES: Mutex<()> = Mutex::new(());
 
-/// The handle of `raw`, which `sel` made: the object of the same device made before, or a new
-/// one, kept. The process's first device's sampler ID pool is the one Metal's sampler mempool
+/// The runtime device of the first device the process adopted, if it adopted one.
+pub(crate) fn first_adopted() -> Option<rt::Device> {
+    let devices = DEVICES.lock();
+    devices.first().map(|(_, device)| device.raw.clone())
+}
+
+/// The handle of `raw`, a device the runtime made: the object of the same device made before, or
+/// a new one, kept. The process's first device's sampler ID pool is the one Metal's sampler mempool
 /// follows ([`metal_space::count_sampler_ids`]). A new device's class joins the process's
 /// placement of degradations ([`crate::answer::native::device_made`]).
-pub fn adopt(sel: &'static str, raw: rt::Device) -> VulkanDevice {
-    crate::platform::answered_at(sel, raw.properties().metal_level);
+pub fn adopt(raw: rt::Device) -> VulkanDevice {
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
     if let Some((_, kept)) = devices.iter().find(|(at, _)| *at == id) {
@@ -448,9 +453,7 @@ impl VulkanDevice {
 
     /// The runtime's model of Metal's answer to `heapTextureSizeAndAlignWithDescriptor:` for
     /// `desc` (`Device::metal_heap_texture_size_and_align`), asked inside `sel`: the
-    /// same on every device at the device's Metal level (the host's release on macOS,
-    /// [`crate::os::METAL_LEVEL`] elsewhere), whatever its image needs, with no image made and
-    /// nothing announced. `None` where the model has no answer (a format or a sample count not
+    /// same on every device, whatever its image needs, with no image made and nothing announced. `None` where the model has no answer (a format or a sample count not
     /// measured), and where the runtime refuses the descriptor. What
     /// [`metal_space::own_heap_size`] takes first.
     pub(crate) fn metal_answer_at(
@@ -747,9 +750,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// dies where the runtime's size decides it, as its image needs that size in the heap
     /// (`crate::gpu::resource::Placements`).
     /// It relays, naming the kind and the texture, and in strict mode dies at the selector, for a
-    /// texture whose layout in Metal's heaps the runtime does not model, a PVRTC format at Metal
-    /// level 26.7, whose
-    /// size and alignment the runtime answers as its device's image's, larger or smaller than
+    /// texture whose layout in Metal's heaps the runtime does not model, whose size and alignment the runtime answers as its device's image's, larger or smaller than
     /// Metal's, and announces so (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`];
     /// [`metal_space::unmeasured_size`]): the guest reads the answer, and no suite case or guest
     /// run asks it of such a texture. The runtime refuses 8 samples first on every device, as
@@ -1179,18 +1180,15 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         }
         // Metal answers nil for a value the runtime keeps raw at a storage other than `Private`,
         // as for every format, and at `Private` for 630 to 650 where it describes no format for
-        // them, as both levels the runtime measured do; it makes a texture of a format it
-        // describes, and asserts at 255 and 262 (measured at macOS 26.7 and 27.0.1:
-        // `formats_the_runtime_lacks_die_where_textures_are_made`; a level that describes one of
-        // 630 to 650 makes it, which dies where it is made, as nothing measured it). It answers
+        // them; it makes a texture of a format it describes, and asserts at 255 and 262
+        // (measured: `formats_the_runtime_lacks_die_where_textures_are_made`). It answers
         // nil for `MTLPixelFormatInvalid` at either storage (measured:
         // `invalid_formats_are_metals`).
         const PRIVATE: u64 = 2;
         let storage = (fields.desc.resource_options.raw() >> 4) & 0xf;
         if let Some(raw) = fields.lacked_format
             && (storage != PRIVATE
-                || (matches!(raw, 630..=650)
-                    && !crate::gpu::format_info::describes_answer(sel, raw)))
+                || (matches!(raw, 630..=650) && !crate::gpu::format_info::described(sel, raw)))
         {
             return Ok(None);
         }
@@ -1202,9 +1200,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let desc = fields.descriptor(sel, Maker::Shared);
         // Its range of Metal's space, placed before the runtime makes it, at `Private` storage,
         // where it would be made: its allocation is sized by Apple's layout from Metal's
-        // description of its format, so a format the device's Metal level describes and macOS
-        // 26.7, where the layout was measured, does not (none at the runtime's levels) dies here
-        // before the runtime makes anything ([`crate::gpu::format_info::block`]). At another
+        // description of its format ([`crate::gpu::format_info::block`]). At another
         // storage the runtime answers nil, as Metal does, and nothing is placed; a texture the
         // runtime made there would hold no range of Metal's space where Metal makes none, so it
         // dies. The runtime's range token holds it until the runtime frees the texture, and its
@@ -1278,8 +1274,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// has no answer, a depth or stencil texture without `allowGPUOptimizedContents` whose size the
     /// runtime answers larger than Metal's (`optimized-depth-stencil-texture`) and Metal's is not
     /// measured for dies here, at every shape; so does one whose layout in Metal's heaps the
-    /// runtime does not model (`unmeasured-heap-texture-size`: a PVRTC format at Metal level 26.7),
-    /// at every shape ([`metal_space::unmeasured_size`]). One of protection options other than none
+    /// runtime does not model (`unmeasured-heap-texture-size`), at every shape ([`metal_space::unmeasured_size`]). One of protection options other than none
     /// is made as without them, relayed, where Metal answers nil
     /// ([`crate::gpu::desc::TextureFields::made_unprotected`]).
     fn new_texture(
@@ -1478,18 +1473,15 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         })
     }
 
-    /// Metal's description of the format at the device's Metal level, the runtime's
+    /// Metal's description of the format, the runtime's
     /// ([`crate::gpu::format_info::description`]).
     fn pixel_format_info(&self, format: u64) -> PixelFormatInfo {
-        let sel = "MTLPixelFormatGetInfoForDevice()";
-        plain(|| crate::gpu::format_info::description(sel, &self.raw, format))
+        plain(|| crate::gpu::format_info::description(&self.raw, format))
     }
 
-    /// Metal's layout of the level at the device's Metal level, the runtime's
-    /// ([`crate::gpu::format_info::level_layout`]).
+    /// Metal's layout of the level, the runtime's ([`crate::gpu::format_info::level_layout`]).
     fn texture_level_info(&self, q: &TextureLevelQuery) -> TextureLevelInfo {
-        let sel = "MTLGetTextureLevelInfoForDeviceWithOptions()";
-        plain(|| crate::gpu::format_info::level_layout(sel, &self.raw, q))
+        plain(|| crate::gpu::format_info::level_layout(&self.raw, q))
     }
 
     /// Read on the first call for this device object, then shared: the heap-buffer query's length
@@ -1842,33 +1834,8 @@ pub(crate) mod tests {
             .expect("OUT_DIR: run the tests with cargo or nextest")
     }
 
-    /// A device of the system default's physical device, made with the platform's options but
-    /// `policy` as the runtime's device policy, whatever `REIMS_VGPU_EXACT` names: one for the
-    /// process for each policy, the runtime's device of those options, so a test's every texture,
-    /// pipeline and dispatch is the same device's. Where the platform's options already take
-    /// `policy`, the shared device ([`dev`]). Made after it, so the process's placement and
-    /// sampler ID pool follow the shared device, and not kept for [`adopt`].
-    pub(crate) fn device_with_policy(policy: metal2vulkan::device::DevicePolicy) -> VulkanDevice {
-        static MADE: reims_vgpu_core::sync::Mutex<
-            Vec<(metal2vulkan::device::DevicePolicy, VulkanDevice)>,
-        > = reims_vgpu_core::sync::Mutex::new(Vec::new());
-        let shared = dev();
-        let mut options = crate::platform::device_options().clone();
-        if options.policy == policy {
-            return shared;
-        }
-        let mut made = MADE.lock();
-        if let Some((_, kept)) = made.iter().find(|(p, _)| *p == policy) {
-            return kept.clone_ref();
-        }
-        options.policy = policy;
-        let device = device_of_options(&options);
-        made.push((policy, device.clone_ref()));
-        device
-    }
-
     /// A device of the system default's physical device made with `options`, after the shared
-    /// device ([`dev`]) and not kept for [`adopt`], as [`device_with_policy`]'s are.
+    /// device ([`dev`]) and not kept for [`adopt`].
     pub(crate) fn device_of_options(options: &rt::DeviceOptions) -> VulkanDevice {
         drop(dev());
         let raw = rt::Device::system_default_with(options).unwrap();
@@ -2424,7 +2391,7 @@ pub(crate) mod tests {
     #[test]
     fn a_device_is_one_object() {
         let d = dev();
-        let again = adopt("MTLCopyAllDevices()", d.raw.clone());
+        let again = adopt(d.raw.clone());
         assert_eq!(again.id(), d.id());
         assert!(!d.raw.name().is_empty());
     }
