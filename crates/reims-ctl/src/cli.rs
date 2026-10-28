@@ -337,6 +337,10 @@ pub struct SetArgs {
     /// auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
     #[arg(long)]
     pub gpu: Option<String>,
+    /// On reims-vgpu: the host's hardware video decode, encode and scaling for the guest. Off,
+    /// the guest does them in software
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub video_acceleration: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub logs: Option<bool>,
     /// REIMS_VGPU_LOG's filter, such as info or warn,reims_vgpu_core=debug
@@ -857,6 +861,17 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             },
         );
     }
+    if c.graphics == vm::Graphics::ReimsVgpu {
+        add(
+            "video",
+            if c.video_acceleration {
+                "on (the host's hardware)"
+            } else {
+                "off (the guest's software)"
+            }
+            .into(),
+        );
+    }
     if let Some(q) = &c.q35 {
         add("opencore", paths::tilde(&vm.path(&q.opencore)));
         add(
@@ -1035,6 +1050,9 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     }
     if let Some(g) = &a.gpu {
         c.gpu = resolve_gpu(g)?;
+    }
+    if let Some(b) = a.video_acceleration {
+        c.video_acceleration = b;
     }
     if let Some(b) = a.logs {
         c.logs.enabled = b;

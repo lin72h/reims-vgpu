@@ -1442,7 +1442,8 @@ impl App {
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
         ];
-        // The displays' and the GPU's fields are reims-vgpu's; an arm64 VM has no other.
+        // The displays', the GPU's and video acceleration's fields are reims-vgpu's; an arm64 VM
+        // has no other.
         let library = &["reims-vgpu"];
         if c.profile == Profile::Q35X86_64 {
             let options = Graphics::ALL.map(|g| (g.id().to_string(), g.describe().to_string()));
@@ -1493,6 +1494,14 @@ impl App {
             fields.push(self.gpu_field(&c.gpu).show_if("graphics", library));
         }
         fields.extend([
+            Field::toggle(
+                "video_acceleration",
+                "Video acceleration",
+                c.video_acceleration,
+                "The guest decodes, encodes and scales video on the host's hardware. Off, it \
+                 does all of that in software.",
+            )
+            .show_if("graphics", library),
             Field::toggle(
                 "audio",
                 "Audio",
@@ -2260,6 +2269,10 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
             c.gpu = gpu_from_choice(&id, gpus.unwrap_or(&[]));
         }
     }
+    // Hidden on VMware SVGA, which has no video devices, it stays as it was.
+    if f.is_shown("video_acceleration") {
+        c.video_acceleration = f.toggle("video_acceleration");
+    }
     c.audio.enabled = f.toggle("audio");
     c.logs.enabled = f.toggle("logs");
     if f.is_shown("log_level") && !f.text("log_level").is_empty() {
@@ -2396,11 +2409,12 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
               when its shutdown timeout ends (edit e to change it)
   K           kill it: power it off at once
   e           edit its settings: CPUs, memory, displays, resolution, HiDPI, borderless,
-              GPU, audio, network, logs, extra QEMU arguments (they apply at its next start),
-              and on x86-64 its disk controller (SATA, or NVMe once macOS is installed), its
-              installer image, its boot selection (OpenCore's picker, which makes it a new
-              OpenCore image) and graphics: reims-vgpu, or QEMU's VMware SVGA, one display
-              with no GPU acceleration, in QEMU's own window
+              GPU, video acceleration (the host's hardware video decode, encode and
+              scaling), audio, network, logs, extra QEMU arguments (they apply at its next
+              start), and on x86-64 its disk controller (SATA, or NVMe once macOS is
+              installed), its installer image, its boot selection (OpenCore's picker, which
+              makes it a new OpenCore image) and graphics: reims-vgpu, or QEMU's VMware
+              SVGA, one display with no GPU acceleration, in QEMU's own window
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and
@@ -2823,6 +2837,50 @@ mod tests {
         app.table.select(Some(1));
         app.open_edit();
         assert!(!form(&app).is_shown("disk_controller"));
+    }
+
+    /// The edit form turns video acceleration off on reims-vgpu, on either kind of VM, and has
+    /// no such field on VMware SVGA, which has no video devices, whose setting stays as it was.
+    #[test]
+    fn the_edit_form_turns_video_acceleration_off() {
+        let mut svga = vm_row("s", true);
+        let c = &mut svga.vm.as_mut().unwrap().config;
+        c.graphics = Graphics::VmwareSvga;
+        c.video_acceleration = false;
+        let mut arm64 = vm_row("a", false);
+        arm64.vm.as_mut().unwrap().config.vmapple = Some(crate::vm::Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1234,
+        });
+        let mut app = test_app(vec![vm_row("t", true), arm64, svga]);
+        for row in [0, 1] {
+            app.overlay = None;
+            app.table.select(Some(row));
+            app.open_edit();
+            assert!(form(&app).toggle("video_acceleration"));
+            for _ in 0..form(&app).fields.len() {
+                if form(&app).focused_key() == "video_acceleration" {
+                    break;
+                }
+                press(&mut app, [KeyCode::Down]);
+            }
+            press(&mut app, [KeyCode::Right]);
+            let mut vm = app.rows[row].vm.as_ref().unwrap().clone();
+            apply_edit(&mut vm, form(&app), None).unwrap();
+            assert!(!vm.config.video_acceleration);
+        }
+
+        app.overlay = None;
+        app.table.select(Some(2));
+        app.open_edit();
+        assert!(!form(&app).is_shown("video_acceleration"));
+        let mut vm = app.rows[2].vm.as_ref().unwrap().clone();
+        vm.config.video_acceleration = true;
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert!(
+            vm.config.video_acceleration,
+            "a hidden field changes nothing"
+        );
     }
 
     #[test]

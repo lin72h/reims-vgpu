@@ -291,6 +291,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
         stop_timeout_secs: 90,
         extra_args: vec![],
         graphics: Graphics::ReimsVgpu,
+        video_acceleration: true,
         display: spec.display.clone(),
         gpu: spec.gpu.clone(),
         audio: Audio {

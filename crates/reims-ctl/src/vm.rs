@@ -32,6 +32,11 @@ pub struct VmConfig {
     pub extra_args: Vec<String>,
     #[serde(default, skip_serializing_if = "Graphics::is_reims_vgpu")]
     pub graphics: Graphics,
+    /// The host's video decode, encode and scaling for the guest, on reims-vgpu: the
+    /// VideoToolbox and M2 scaler devices (`qemu`'s module doc). Off, the VM has neither, and
+    /// the guest does all three in software. On unless its settings say off.
+    #[serde(default = "on", skip_serializing_if = "is_on")]
+    pub video_acceleration: bool,
     #[serde(default)]
     pub display: Display,
     #[serde(default)]
@@ -52,6 +57,14 @@ pub struct VmConfig {
 
 fn default_stop_timeout() -> u64 {
     DEFAULT_STOP_TIMEOUT.as_secs()
+}
+
+fn on() -> bool {
+    true
+}
+
+fn is_on(b: &bool) -> bool {
+    *b
 }
 
 /// How long `stop` waits for the guest by default.
@@ -989,6 +1002,7 @@ mod tests {
             stop_timeout_secs: 90,
             extra_args: vec!["-boot".into(), "menu=on".into()],
             graphics: Graphics::ReimsVgpu,
+            video_acceleration: true,
             display: Display::default(),
             gpu: Gpu {
                 driver_file: Some("/usr/share/vulkan/icd.d/nvidia_icd.json".into()),
@@ -1050,6 +1064,22 @@ mod tests {
             let q = toml::from_str::<VmConfig>(&named).unwrap().q35.unwrap();
             assert_eq!(q.disk_controller, d);
         }
+    }
+
+    /// A VM whose settings don't name video acceleration has it on, and saves as it did before
+    /// the switch existed; one with it off saves it off.
+    #[test]
+    fn video_acceleration_is_on_unless_the_settings_say_off() {
+        let mut c = x86_64_config();
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(!text.contains("video_acceleration"), "{text}");
+        let loaded = toml::from_str::<VmConfig>(&text).unwrap();
+        assert!(loaded.video_acceleration);
+        assert_eq!(toml::to_string_pretty(&loaded).unwrap(), text);
+        c.video_acceleration = false;
+        let off = toml::to_string_pretty(&c).unwrap();
+        assert!(off.contains("video_acceleration = false\n"), "{off}");
+        assert_eq!(toml::from_str::<VmConfig>(&off).unwrap(), c);
     }
 
     /// A VM an earlier create saved with an SSH port of 0 has no forward, as `set --ssh-port 0`

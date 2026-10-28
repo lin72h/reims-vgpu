@@ -57,6 +57,8 @@
 //! mapper driver, so an x86-64 VM has the devices at slots 8 and 9, after its mapper, and one on
 //! `vmware-svga`, which has no mapper, has neither. A guest without the drivers leaves both
 //! devices without one (docs/qemu.md, "The VideoToolbox device" and "The M2 scaler device").
+//! A VM whose settings turn video acceleration off (`video_acceleration = false`) has neither,
+//! and its guest decodes, encodes and scales video in software.
 //!
 //! `vmapple-arm64` follows scripts/internal/run_vmapple.sh, with the video devices besides.
 
@@ -299,12 +301,14 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
             "apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6",
         ]);
         // The video devices, whose guest drivers link the mapper's (the module doc).
-        push(&[
-            "-device",
-            "apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8",
-            "-device",
-            "apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9",
-        ]);
+        if c.video_acceleration {
+            push(&[
+                "-device",
+                "apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8",
+                "-device",
+                "apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9",
+            ]);
+        }
     }
     push(&[
         "-device",
@@ -378,12 +382,14 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         &format!("apple-gfx-mmio.resolution={}", c.display.qemu_resolution()?),
     ]);
     // The video devices, whose guest drivers arm64 macOS ships (the module doc).
-    push(&[
-        "-device",
-        "apple-videotoolbox-pci,id=video",
-        "-device",
-        "apple-m2scaler-pci,id=scaler",
-    ]);
+    if c.video_acceleration {
+        push(&[
+            "-device",
+            "apple-videotoolbox-pci,id=video",
+            "-device",
+            "apple-m2scaler-pci,id=scaler",
+        ]);
+    }
     if c.audio.enabled {
         push(&["-audiodev", &audiodev(vm, ctx)]);
         push(&["-device", "virtio-sound-pci,id=audio,audiodev=snd0"]);
@@ -530,6 +536,7 @@ mod tests {
                 stop_timeout_secs: 90,
                 extra_args: vec![],
                 graphics: Graphics::ReimsVgpu,
+                video_acceleration: true,
                 display: Display::default(),
                 gpu: Gpu::default(),
                 audio: Audio::default(),
@@ -734,6 +741,36 @@ mod tests {
             );
         }
         assert!(!inv.args.iter().any(|a| a.contains("virtio-sound")));
+    }
+
+    /// With video acceleration off, a VM's command line is the one with it on less the two video
+    /// devices, on q35 and on vmapple.
+    #[test]
+    fn video_acceleration_off_leaves_out_both_video_devices() {
+        let mut vmapple = q35_vm();
+        vmapple.config.profile = Profile::VmappleArm64;
+        vmapple.config.q35 = None;
+        vmapple.config.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1234,
+        });
+        for (vm, host) in [(q35_vm(), linux()), (vmapple, mac())] {
+            let mut on = invocation(&vm, &ctx(host)).unwrap().args;
+            let i = on
+                .iter()
+                .position(|x| x.starts_with("apple-videotoolbox-pci,"))
+                .unwrap();
+            assert!(
+                on[i - 1] == "-device"
+                    && on[i + 1] == "-device"
+                    && on[i + 2].starts_with("apple-m2scaler-pci,"),
+                "{on:?}"
+            );
+            on.drain(i - 1..i + 3);
+            let mut off = vm.clone();
+            off.config.video_acceleration = false;
+            assert_eq!(invocation(&off, &ctx(host)).unwrap().args, on);
+        }
     }
 
     /// A disk moved to NVMe is on a controller of its own, off the AHCI controller.
