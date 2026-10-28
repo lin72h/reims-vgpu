@@ -802,9 +802,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// buffer, is nil, as Metal answers. So is memory with a page not mapped, or mapped without
     /// read access, which Metal makes no buffer over (measured: PROT_NONE pages, an unmapped
     /// page, and a range of a mapped and an unmapped page are nil; read-only pages make a
-    /// buffer): the runtime imports the pages as it makes the buffer, as Metal wires them, and
-    /// refuses those it cannot import, which [`OsVm::readable`] tells from its other
-    /// refusals, which die. The deallocator runs once, when the runtime releases the buffer; one
+    /// buffer): such memory ([`OsVm::readable`]) is nil before the runtime is asked, so no range
+    /// of the runtime's is placed for it (a placed buffer the runtime refuses keeps its range held,
+    /// measured at metal2vulkan 0a1851164d, where a later buffer Metal places at that address would
+    /// conflict), and the runtime's refusals die. The deallocator runs once, when the runtime
+    /// releases the buffer; one
     /// the runtime refuses never runs, and its captures are kept. At the address Metal's space
     /// gives it, keeping the pointer's offset into its page ([`metal_space`]), so made through
     /// the runtime's descriptor, which takes an address.
@@ -835,6 +837,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
             Policy::Dies,
             placed_nil(&placing, Nil::BufferLength),
             || {
+                // Pages Metal makes no buffer over: nil.
+                if !OsVm::new().readable(bytes.ptr(), bytes.len()) {
+                    return Ok(None);
+                }
                 // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator
                 // runs, or for the buffer's life with none, and an unmap of core's through the
                 // platform's VM waits for the keep-alive; a twin of them stays until it goes.
@@ -846,15 +852,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 };
                 let descriptor = rt::BufferDescriptor::new(bytes.len(), options, contents)
                     .with_placement(placement);
-                match self
-                    .raw
+                (self.raw)
                     .new_buffer_with_descriptor(with_token(descriptor, token))
-                {
-                    Ok(raw) => Ok(Some(raw)),
-                    // Pages Metal makes no buffer over: nil.
-                    Err(_) if !OsVm::new().readable(bytes.ptr(), bytes.len()) => Ok(None),
-                    Err(e) => Err(e),
-                }
+                    .map(Some)
             },
         )
         .map(Option::flatten);

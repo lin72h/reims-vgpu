@@ -897,6 +897,20 @@ pub fn create<T>(
 ///   the hardware forces it, so a native device does not relay it. Announced once per device
 ///   whatever `announce_each` asks, on the runtime's scheduler thread, outside every call here: it
 ///   would die where it is announced;
+/// - `DrawDroppedStillMaking` and `DispatchDroppedStillMaking`: under the runtime's
+///   `PipelineWaitPolicy::Bounded`, its default, a draw, compute dispatch or tile dispatch whose
+///   `VkPipeline` the driver was still making 4.5 s after its command buffer's commit ran nothing,
+///   the command buffer running on, where Metal's draw renders and its dispatch writes: a cold
+///   compile (seconds on MoltenVK with a cold Metal compiler service) then costs that command's
+///   work, not a stall past the guest's 10 s check of its FIFO. A strict process takes
+///   `PipelineWaitPolicy::Exact` ([`crate::platform`]'s device options), which waits until the
+///   pipeline is made, so a strict run, this crate's tests among them, never dies of a slow
+///   compile. Announced where the command is recorded: in the commit, or the command buffer's
+///   host step;
+/// - `DrawDroppedUnmade`: a draw whose `VkPipeline` the driver failed to make after the draw
+///   returned ran nothing, the command buffer running on, where Metal's draw renders, and Metal
+///   fails the state's creation instead. Announced where the draw is recorded: in the commit, or
+///   the command buffer's host step;
 /// - six kinds no device on Metal announces, each dying where a device announces it, at its
 ///   selector, as no fact of the hardware forces it:
 ///   - `VisibilityCountPerColor`: a draw counted by a `Counting` visibility result whose
@@ -1129,7 +1143,13 @@ pub fn create<T>(
 ///   read-only, imported as dma-bufs of its pages, whose GPU writes reach the pages, where after
 ///   Metal's the CPU reads them as they were. Announced inside the call that makes it, which dies
 ///   at its selector. This platform gives the runtime a writable twin of read-only pages on Linux
-///   (`crate::os`'s import), whose writes die where they are encoded, so no call here reaches it.
+///   (`crate::os`'s import), whose writes die where they are encoded, so no call here reaches it;
+/// - `CopiedHostPages`: a no-copy buffer, heap or rebind made over a copy of the guest's pages in
+///   memory of the device's own, as their import failed (out of memory, or a driver out of the
+///   mappings the host's kernel allows), which each commit fills from the pages and each
+///   completion writes back: a CPU write the GPU reads mid-command-buffer, or a GPU write the CPU
+///   reads before the batch completes, is not seen, where Metal's GPU uses the pages themselves.
+///   Announced inside the call that makes it, which dies at its selector.
 ///
 /// Every kind not listed here or in [`HEARD`] is relayed, those the guest sees included, each for
 /// one of the reasons the module's docs give: logged once per device and not dying. Each relayed
@@ -1138,7 +1158,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 129] = [
+pub const DIES: [rt::Degradation; 133] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1224,6 +1244,9 @@ pub const DIES: [rt::Degradation; 129] = [
     rt::Degradation::HeapTextureLargerThanMetal,
     rt::Degradation::HostDeallocatorDelayed,
     rt::Degradation::GroupedCompletion,
+    rt::Degradation::DrawDroppedStillMaking,
+    rt::Degradation::DispatchDroppedStillMaking,
+    rt::Degradation::DrawDroppedUnmade,
     rt::Degradation::VisibilityCountPerColor,
     rt::Degradation::ColorAttachmentGroups,
     rt::Degradation::DevicePointSize,
@@ -1266,6 +1289,7 @@ pub const DIES: [rt::Degradation; 129] = [
     rt::Degradation::PredicationWordPastBuffer,
     rt::Degradation::HeapTwoPlaneLayout,
     rt::Degradation::ReadOnlyPagesWritten,
+    rt::Degradation::CopiedHostPages,
     rt::Degradation::CoverageReadsRoundedAlpha,
     rt::Degradation::UnmeasuredFetchBlend,
 ];

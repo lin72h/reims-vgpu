@@ -250,7 +250,10 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
 /// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], a command buffer's
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
 /// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
-/// names ([`exact_policy`]), and the degradations the
+/// names ([`exact_policy`]), and in a strict process ([`crate::answer::strict_process`]) its
+/// exact pipeline wait, under which no draw or dispatch is dropped while its pipeline is still
+/// being made (the runtime's `DrawDroppedStillMaking` and `DispatchDroppedStillMaking`, kinds of
+/// [`crate::answer::DIES`]), and the degradations the
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
 /// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
@@ -290,6 +293,9 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         crate::os::add_window_extensions(&mut options);
         options.gpu_times_from_host = true;
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
+        if crate::answer::strict_process() {
+            options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
+        }
         let sink = rt::MessageSink::new(crate::answer::notice);
         options.messages = Some(sink.with_least_severity(crate::answer::least_severity()));
         options.announce_each =
@@ -322,12 +328,20 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// (`host_page_textures`, `HostPageTexturePolicy::Shadow`), and, on a device without
 /// `shaderFloat16`, each `half` addition, subtraction and product of a fast-math chain rounded
 /// where it is computed, where the default rounds the chain where a value leaves it
-/// (`half_chains`, `HalfChainPolicy::EachOperation`). [`EXACT_ALL`] names every one. The
+/// (`half_chains`, `HalfChainPolicy::EachOperation`), and a command buffer that waits for each
+/// pipeline the driver is still making until it is made, where the default waits 4.5 s from its
+/// commit and then drops the draws and dispatches whose pipeline is not made (`pipeline_waits`,
+/// `PipelineWaitPolicy::Exact`). [`EXACT_ALL`] names every one. The
 /// policy's `completion` and `heap_compression` are no names of these: every device takes their
 /// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
 /// device's own arithmetic, sampling and conversions, each difference a precision note it
 /// records, with no exact form to name.
-pub const EXACT_FORMS: [&str; 3] = ["batch_order", "host_page_textures", "half_chains"];
+pub const EXACT_FORMS: [&str; 4] = [
+    "batch_order",
+    "host_page_textures",
+    "half_chains",
+    "pipeline_waits",
+];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
 /// field of [`EXACT_FORMS`] in its exact form, as the runtime's validation sets them.
@@ -355,12 +369,13 @@ pub const EXACT_ALL: &str = "all";
 /// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form:
 /// `batch_order`'s barriers between batches, `host_page_textures`' copies of each sampled texture
 /// over the guest's pages at each command buffer's first use, and `half_chains`' rounding at
-/// each `half` operation on a device without `shaderFloat16`. A name of neither changes nothing,
+/// each `half` operation on a device without `shaderFloat16`, and `pipeline_waits`' wait for
+/// every pipeline until it is made. A name of neither changes nothing,
 /// and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
         BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy, HeapCompressionPolicy,
-        HostPageTexturePolicy,
+        HostPageTexturePolicy, PipelineWaitPolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -371,6 +386,7 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "batch_order" => policy.batch_order = BatchOrderPolicy::Exact,
             "host_page_textures" => policy.host_page_textures = HostPageTexturePolicy::Shadow,
             "half_chains" => policy.half_chains = HalfChainPolicy::EachOperation,
+            "pipeline_waits" => policy.pipeline_waits = PipelineWaitPolicy::Exact,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -674,7 +690,7 @@ pub(crate) mod tests {
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
             BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy,
-            HeapCompressionPolicy, HostPageTexturePolicy,
+            HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -685,6 +701,7 @@ pub(crate) mod tests {
         assert_eq!(fast.batch_order, BatchOrderPolicy::Ends);
         assert_eq!(fast.host_page_textures, HostPageTexturePolicy::InPlace);
         assert_eq!(fast.half_chains, HalfChainPolicy::AtExits);
+        assert_eq!(fast.pipeline_waits, PipelineWaitPolicy::Bounded);
         for unchanged in [
             None,
             Some(""),
@@ -699,13 +716,16 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 3] = [
+        let alone: [(&str, Set); 4] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
             ("host_page_textures", |p| {
                 p.host_page_textures = HostPageTexturePolicy::Shadow;
             }),
             ("half_chains", |p| {
                 p.half_chains = HalfChainPolicy::EachOperation;
+            }),
+            ("pipeline_waits", |p| {
+                p.pipeline_waits = PipelineWaitPolicy::Exact;
             }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
@@ -717,7 +737,7 @@ pub(crate) mod tests {
             assert_eq!(one(name), want, "{name}");
             set(&mut every);
         }
-        let named = " half_chains,host_page_textures , batch_order";
+        let named = " half_chains,pipeline_waits,host_page_textures , batch_order";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         assert_eq!(one(EXACT_ALL), fast.exact_answers());
@@ -835,6 +855,16 @@ pub(crate) mod tests {
     fn the_shader_cache_holds_25_gib() {
         assert_eq!(rt::DEFAULT_CAPACITY, 25 << 30);
         assert_eq!(device_options().shader_cache.capacity, 1 << 30);
+    }
+
+    /// A strict process, as every test of this crate is, waits for each pipeline until it is
+    /// made: no draw or dispatch is dropped for its compile's time, which would die here
+    #[test]
+    fn a_strict_process_waits_for_every_pipeline() {
+        assert_eq!(
+            device_options().policy.pipeline_waits,
+            metal2vulkan::device::PipelineWaitPolicy::Exact
+        );
     }
 
     /// The services are the ones the platform was made with
