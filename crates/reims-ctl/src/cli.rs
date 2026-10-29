@@ -338,7 +338,8 @@ pub struct SetArgs {
     #[arg(long)]
     pub gpu: Option<String>,
     /// On reims-vgpu: the host's hardware video decode, encode and scaling for the guest. Off,
-    /// the guest does them in software
+    /// the guest does them in software. An x86-64 VM goes without it while an installer is
+    /// attached, where macOS Recovery would hang on it
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub video_acceleration: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
