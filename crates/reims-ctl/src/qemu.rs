@@ -60,14 +60,6 @@
 //! A VM whose settings turn video acceleration off (`video_acceleration = false`) has neither,
 //! and its guest decodes, encodes and scales video in software.
 //!
-//! An x86-64 VM has neither while an installer is attached either. In macOS 26's installer and
-//! Recovery, the port's loader finds the System KC's libraries absent and leaves its GPU and
-//! mapper drivers unbound, so the mapper's service never appears. Both video drivers' starts wait
-//! for it with no timeout, and WindowServer then never draws: Recovery hangs at its first screen,
-//! with the display's mode set and nothing drawn (msi-laptop, a 26.7 Recovery, 2026-10-29). Without
-//! the devices the drivers load and match nothing. Lilu's installer-or-recovery mode does not
-//! see that Recovery: VtWaitPatch, which Lilu starts in its normal mode alone, ran in it.
-//!
 //! `vmapple-arm64` follows scripts/internal/run_vmapple.sh, with the video devices besides.
 
 use crate::host::{Host, Os, Profile};
@@ -308,9 +300,8 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
             "-device",
             "apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6",
         ]);
-        // The video devices, whose guest drivers link the mapper's, and none while an installer
-        // is attached (the module doc).
-        if c.video_acceleration && q.installer.is_none() {
+        // The video devices, whose guest drivers link the mapper's (the module doc).
+        if c.video_acceleration {
             push(&[
                 "-device",
                 "apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8",
@@ -780,19 +771,6 @@ mod tests {
             off.config.video_acceleration = false;
             assert_eq!(invocation(&off, &ctx(host)).unwrap().args, on);
         }
-    }
-
-    /// While an installer is attached, an x86-64 VM with video acceleration on has the command
-    /// line of one with it off: neither video device.
-    #[test]
-    fn an_attached_installer_leaves_out_both_video_devices() {
-        let mut on = q35_vm();
-        on.config.q35.as_mut().unwrap().installer = Some("installer.img".into());
-        let mut off = on.clone();
-        off.config.video_acceleration = false;
-        let a = invocation(&on, &ctx(linux())).unwrap().args;
-        assert_eq!(a, invocation(&off, &ctx(linux())).unwrap().args);
-        assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]));
     }
 
     /// A disk moved to NVMe is on a controller of its own, off the AHCI controller.

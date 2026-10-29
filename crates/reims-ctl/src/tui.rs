@@ -1499,8 +1499,7 @@ impl App {
                 "Video acceleration",
                 c.video_acceleration,
                 "The guest decodes, encodes and scales video on the host's hardware. Off, it \
-                 does all of that in software. An x86-64 VM goes without it while an installer \
-                 is attached, where macOS Recovery would hang on it.",
+                 does all of that in software.",
             )
             .show_if("graphics", library),
             Field::toggle(
