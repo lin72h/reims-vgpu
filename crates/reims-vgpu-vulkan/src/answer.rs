@@ -1480,6 +1480,8 @@ thread_local! {
     /// The kinds of [`HEARD`] the runtime announced on this thread inside the innermost
     /// [`hearing`], where one runs.
     static HEARING: RefCell<Option<Vec<rt::Degradation>>> = const { RefCell::new(None) };
+    /// Whether this thread runs an [`unheard`] call.
+    static UNHEARD: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Keeps `notice` for the call here this thread is inside to die at once it returns.
@@ -1584,6 +1586,24 @@ pub fn hearing<T>(call: impl FnOnce() -> T) -> (T, Vec<rt::Degradation>) {
     let out = call();
     let heard = HEARING.with(|h| h.replace(restore.0.take().flatten()));
     (out, heard.unwrap_or_default())
+}
+
+/// Runs `call`, a probe of the device's own outside any guest's work (`crate::os`'s
+/// `learn_view_imports`), with what the runtime announces on this thread inside it heard by no
+/// one: neither relayed, counted, kept nor dying. A kind the runtime announces once per device
+/// is announced at every occurrence where a probe may meet it ([`crate::platform`]'s
+/// `announced_each`), so that the probe's takes no later occurrence's line.
+#[cfg(target_os = "linux")]
+pub(crate) fn unheard<T>(call: impl FnOnce() -> T) -> T {
+    /// Puts back the outer state on drop, an unwinding call's included.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            UNHEARD.with(|u| u.set(self.0));
+        }
+    }
+    let _restore = Restore(UNHEARD.with(|u| u.replace(true)));
+    call()
 }
 
 /// Runs `call`, a runtime call standing for `sel` (none for [`plain`]'s), and dies at `sel`, or
@@ -1707,6 +1727,9 @@ pub fn notice(message: &rt::DebugMessage) {
         relay(message);
         return;
     };
+    if UNHEARD.with(Cell::get) {
+        return;
+    }
     if trace_degradations() && reims_vgpu_core::trace::on() {
         let kind = notice.degradation;
         // deg: an occurrence of a degradation, its code

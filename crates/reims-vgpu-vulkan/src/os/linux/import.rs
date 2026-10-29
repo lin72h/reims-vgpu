@@ -364,7 +364,9 @@ pub(crate) fn pages_from_files(at: NonNull<u8>, length: u64) -> Pinned {
 /// pages backwards, one more than udmabuf takes in one dma-buf, so two, made as an import is,
 /// placed outside the guest's numbering and released at once. Where the device does not take it
 /// through the dma-bufs its source makes, views are mapped from their files from then on
-/// ([`IMPORTS_NEED_FILES`]): where it refuses it, and where it takes the view's pointer, as no
+/// ([`IMPORTS_NEED_FILES`]): where it refuses it, or makes a copy of the view in its place as
+/// its import failed (the runtime's `copied-host-pages`, which the probe's call hears unheard,
+/// `crate::answer::unheard`), and where it takes the view's pointer, as no
 /// driver pins a `VM_PFNMAP` mapping's pages and one that pins them at the GPU's first use of
 /// them, not at the import (as i915's userptr does without `I915_USERPTR_PROBE`, not measured
 /// here), would fail there. A device
@@ -405,7 +407,13 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
         };
         let descriptor = rt::BufferDescriptor::new(length, rt::ResourceOptions::shared(), contents)
             .with_placement(rt::AddressPlacement::Outside);
-        let refused = device.new_buffer_with_descriptor(descriptor).is_err();
+        // A copy of the view in the import's place (`copied-host-pages`), as its import failed,
+        // is the device's refusal too: the probe's own, which no one hears of.
+        let copies = || device.work_counts().copied_host_buffers_made;
+        let before = copies();
+        let made = crate::answer::unheard(|| device.new_buffer_with_descriptor(descriptor));
+        let refused = made.is_err() || copies() > before;
+        drop(made);
         let through_dma_bufs = !refused && asked.load(Ordering::Relaxed);
         let why = dma_buf_refusal();
         log::info!(
@@ -413,7 +421,10 @@ pub(crate) fn learn_view_imports(device: &rt::Device) {
             "{}: an import of a view of guest pages mapped through dma-bufs {}",
             device.properties().name,
             match (refused, through_dma_bufs) {
-                (true, _) => "is refused, so views are mapped from their files",
+                (true, _) => {
+                    "is refused, or copied as its import failed, so views are mapped from their \
+                     files"
+                }
                 (false, false) => {
                     "is taken by its pointer, which a driver pinning the pages at the GPU's first \
                      use of them would fail then, so views are mapped from their files"

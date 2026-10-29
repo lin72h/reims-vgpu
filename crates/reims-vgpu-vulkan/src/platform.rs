@@ -272,8 +272,10 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
 /// them (`timing`'s `gpu_times_from_host_latency`).
 /// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
 /// call here hears ([`crate::answer::HEARD`]) and those that die by default
-/// ([`crate::answer::DIES_BY_DEFAULT`]), and every other kind of [`crate::answer::DIES`] where
-/// `every_dies`, in strict and census mode, which die at or record each occurrence. Elsewhere the
+/// ([`crate::answer::DIES_BY_DEFAULT`]), `CopiedHostPages`, which the device's probe of its imports
+/// may meet unheard as it is made ([`crate::answer::unheard`]), and every other kind of
+/// [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or record
+/// each occurrence. Elsewhere the
 /// runtime announces such a kind once per device, its first occurrence, the only one the default
 /// writes: asked for each, a pipeline variant's notices reach the sink again at every draw's bind,
 /// a cost on the encoding thread (in a Finder drag on ms01's Iris Xe, 2026-10-18, the sink
@@ -284,7 +286,10 @@ fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradatio
     } else {
         &crate::answer::DIES_BY_DEFAULT
     };
-    (dies.iter().copied()).chain(crate::answer::HEARD).collect()
+    (dies.iter().copied())
+        .chain(crate::answer::HEARD)
+        .chain([rt::Degradation::CopiedHostPages])
+        .collect()
 }
 
 pub(crate) fn device_options() -> &'static rt::DeviceOptions {
@@ -616,23 +621,22 @@ pub(crate) mod tests {
     use super::*;
     use crate::gpu::device::tests::dev;
 
-    /// The kinds a call hears and those that die by default are announced at every occurrence in
-    /// every mode, and every other kind of `DIES` only in strict and census mode
+    /// The kinds a call hears, those that die by default and `CopiedHostPages`, which the
+    /// device's probe of its imports meets unheard, are announced at every occurrence in every
+    /// mode, and every other kind of `DIES` only in strict and census mode
     #[test]
     fn only_strict_and_census_mode_hear_every_occurrence_of_every_kind_that_dies() {
         use crate::answer::{DIES, DIES_BY_DEFAULT, HEARD};
         let each = announced_each(true);
         assert!(DIES.iter().chain(&HEARD).all(|k| each.contains(k)));
         let by_default = announced_each(false);
+        let copied = rt::Degradation::CopiedHostPages;
         assert!(
-            HEARD
-                .iter()
-                .chain(&DIES_BY_DEFAULT)
-                .all(|k| by_default.contains(k))
+            (HEARD.iter().chain(&DIES_BY_DEFAULT).chain([&copied])).all(|k| by_default.contains(k))
         );
         let once = DIES
             .iter()
-            .filter(|k| !DIES_BY_DEFAULT.contains(k) && !HEARD.contains(k));
+            .filter(|k| !DIES_BY_DEFAULT.contains(k) && !HEARD.contains(k) && **k != copied);
         assert!(once.clone().count() > 100, "most kinds of DIES");
         assert!(once.clone().all(|k| !by_default.contains(k)));
     }
