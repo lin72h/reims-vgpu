@@ -173,7 +173,7 @@ impl ImportView {
 }
 
 /// The memory the runtime imports for `length` bytes at `at`: those bytes ([`ImportView`]).
-pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64, _gated: bool) -> ImportView {
+pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView {
     ImportView { at }
 }
 

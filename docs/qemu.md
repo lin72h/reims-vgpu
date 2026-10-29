@@ -698,21 +698,53 @@ through dma-bufs"). How the GPU then takes those pages depends on its driver:
 - **RADV** imports such a view through the dma-bufs, so the views stay small.
 - **NVIDIA's driver** (615) pins a pointer's pages, and refused both a pointer
   into a udmabuf mapping and the dma-buf itself. A probe finds this as the
-  device is made. From then on, views are mapped from their files while they
-  fit 8,192 mappings short of the budget (`budget.rs`, `HEADROOM`), and
-  through dma-bufs past that. A no-copy buffer's or heap's import of a view's
-  pages maps them from their files while they fit short of those 8,192
-  mappings too, as does the writable twin a buffer's import of read-only
-  pages needs. Past that line the library's import gate refuses the pages,
-  and the runtime makes the buffer or heap over a copy of them in the GPU's
-  own memory, which takes no mapping: it works, but costs each command buffer
-  a compare of the copy's bytes, so a raised limit is a speed-up
-  (metal2vulkan's `HostMemory::with_import_gate`, announced
-  `copied-host-pages`; with `REIMS_VGPU_STRICT=1` it ends the process). A
-  rebind's or a device lend's import has no other way, and maps its pages
-  from their files into the 8,192 mappings too. Only past the whole budget
-  is it handed over as mapped, which the driver refuses; with
-  `REIMS_VGPU_STRICT=1` it ends the process.
+  device is made: its import fails, and the copy the runtime makes in its
+  place counts as the refusal. From then on:
+  - The device is handed the guest's RAM whole (metal2vulkan's `HostRam`,
+    `crates/reims-vgpu-vulkan/src/os/linux/host_ram.rs`). An object whose
+    pages are one run of the RAM inside one 64 MiB chunk of it is bound in
+    the device's import of that chunk, made the first time an object over it
+    is made: it takes no mapping and asks no gate. A device without
+    `VK_EXT_external_memory_host` is not handed the RAM, said once in the
+    log, and its objects take the ways below.
+  - Views are mapped from their files while they fit 8,192 mappings short of
+    the budget (`budget.rs`, `HEADROOM`), and through dma-bufs past that. Any
+    other import of a view's pages (a no-copy buffer's, a heap's or a
+    rebind's) maps them from their files while they fit short of those 8,192
+    mappings too, as does the writable twin an import of read-only pages
+    needs. Past that line the library's import gate refuses the pages, and
+    the runtime makes the object over a copy of them, which takes no mapping
+    (metal2vulkan's `HostMemory::with_import_gate`, announced
+    `copied-host-pages`; with `REIMS_VGPU_STRICT=1` it ends the process). The
+    copy lies in host-cached system memory, compared whole on the CPU at each
+    commit and each completion, and it reads the pages with the CPU, which
+    reads pages left in views through dma-bufs too.
+  - Measured on the RTX 5080 Laptop host at the kernel's default of 65,530
+    (2026-10-29), at metal2vulkan 0dfdbcd59d, before both: the copy's first
+    read went through the kernel (`process_vm_readv`), which cannot read
+    pages left in views through dma-bufs, so the runtime refused the buffer.
+    A 16 GiB x86-64 macOS 26 guest at 3840x2160 HiDPI died about 17 s into
+    its boot, before the desktop, where a 63.3 MiB surface past the headroom
+    (16,202 mappings) went to the copy and the texture made over it was
+    refused (`newTextureWithDescriptor:iosurface:plane:`); at 1,048,576 the
+    same guest ran a Finder drag at 50-59 fps. At metal2vulkan daf1bf625f,
+    with the RAM handed over whole, the same guest at 65,530 reached its
+    desktop about 80 s into its boot and ran Finder, Safari, Mission
+    Control, the Apps stack and Photos for 12 minutes with no fatal line, but
+    slowly: by the end 1,024 buffers and heaps (551 MiB) and 64 more over
+    read-only pages (13 MiB) were copies, a Finder drag ran at a median of
+    5 fps and the rest at a median under one frame a second, with frames up
+    to 15 s apart. At metal2vulkan f4f88dad89, whose copies compare a page at
+    a time and only the pages the dirty log reports written, the same boot
+    had its desktop by 30 s and ran the same workload for 9 minutes with no
+    fatal line and more copies (2,048 buffers and heaps, 1,079 MiB, and 256
+    over read-only pages, 50 MiB): medians of 29 fps for the Finder drag, 19
+    for a Safari drag, 5 for a Safari scroll and 8 for the Apps stack, while
+    Mission Control stayed under one frame a second.
+  - A device lend (the video device's decoder writing a frame into the
+    guest's buffer) maps its pages from their files only short of those
+    8,192: past them the decoder declines the frame, and the session copies
+    it into the guest's buffer on the CPU, the same bytes.
 - **Before anything would die or be refused at the whole budget**, the
   library folds back into dma-bufs the views' pages mapped from their files
   that no live import a device may pin holds, and weighs again (`vm.rs`,
@@ -753,12 +785,14 @@ What gets logged:
   if imports of all of the guest's RAM, a mapping per 4 KiB page, would come
   within the headroom of the budget, with the `sysctl -w
   vm.max_map_count=...` value that covers them (2^23, 8,388,608, for a 16 GiB
-  guest): past that, buffers and heaps are copied.
-- Each buffer or heap copied for want of mappings, and each import handed
-  over as mapped, is counted with its bytes, logged at the first and at each
-  power of two, and written to the trace (`nrcopy` for pages left in
-  dma-bufs, `notwin` for read-only pages with no twin, `noroom` for an
-  import handed over: first byte, length, mappings it would have taken).
+  guest): past that, buffers and heaps not bound in a chunk are copied.
+- Each buffer, heap or rebind copied for want of mappings is counted with
+  its bytes, logged at the first and at each power of two, and written to
+  the trace (`nrcopy` for pages left in dma-bufs, `notwin` for read-only
+  pages with no twin: first byte, length, mappings it would have taken).
+- On a device that needs pages mapped from their files but takes no host
+  memory by its pointer, an information line, once, that the guest's RAM is
+  not used whole.
 
 ### Linux hosts: AMD GPUs and udmabuf
 

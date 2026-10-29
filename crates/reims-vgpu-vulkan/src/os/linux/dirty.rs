@@ -239,6 +239,21 @@ impl ImportDirty {
         })
     }
 
+    /// The answers for the whole of a guest's RAM, its offsets host addresses (the runtime's
+    /// `HostRam::with_dirty_pages`, whose log's pointer is 0), where host address `first`, a byte
+    /// of the RAM, lies in the RAM of a device with a dirty log; `None` otherwise.
+    pub(crate) fn of_ram(first: u64) -> Option<ImportDirty> {
+        let first = resolved(first, 1).into_iter().next()?;
+        let (log, _) = first.ram?;
+        Some(ImportDirty {
+            shared: Arc::new(Shared {
+                log,
+                at: 0,
+                watches: Mutex::new(Vec::new()),
+            }),
+        })
+    }
+
     /// The import's bytes `range` as segments of the import, in this log's RAM or none.
     fn segments(&self, range: &Range<u64>) -> Vec<Segment> {
         let length = range.end.saturating_sub(range.start);

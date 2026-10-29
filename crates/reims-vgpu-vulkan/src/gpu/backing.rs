@@ -1221,7 +1221,7 @@ impl Alias {
             match import.upgrade() {
                 Some(view) => view,
                 None => {
-                    let view = Arc::new(crate::os::import_view(first, self.length, site.gated()));
+                    let view = Arc::new(crate::os::import_view(first, self.length));
                     *import = Arc::downgrade(&view);
                     view
                 }
@@ -1275,15 +1275,6 @@ pub(crate) enum ImportSite {
 }
 
 impl ImportSite {
-    /// Whether the runtime asks the platform's gate before it imports the pages by their pointer
-    /// (`rt::HostMemory::with_import_gate`, `crate::os::import_view`): for a no-copy buffer's or
-    /// heap's, which it makes over a copy where the gate refuses. Not for a replace's: a heap's
-    /// rebind is never asked, and a buffer's rebind the gate refuses is refused itself where a
-    /// texture's image lies in place over the buffer, which would die here.
-    pub(crate) fn gated(self) -> bool {
-        !matches!(self, Self::Replace)
-    }
-
     /// The site's number in the trace.
     fn code(self) -> u64 {
         match self {

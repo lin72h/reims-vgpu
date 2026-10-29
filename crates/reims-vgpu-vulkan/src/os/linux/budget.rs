@@ -22,10 +22,12 @@
 //! [`HEADROOM`] below it ([`claim`], [`Reach::ShortOfHeadroom`]): a view a device would need from
 //! its files goes through dma-bufs instead, and a no-copy buffer's or heap's import of such a
 //! view's pages, or of read-only pages with no twin, is refused at the runtime's gate, the buffer
-//! or heap made over a copy (`super::vm`'s module docs, "Imports of views"). What has no other way
-//! has the headroom to itself: a view through dma-bufs, a range, a twin of a rebind's pages or a
-//! stand-in, and the pages a rebind's or a device lend's import maps from their files, which no
-//! gate refuses ([`Reach::Whole`]).
+//! or heap made over a copy (`super::vm`'s module docs, "Imports of views"), as a rebind's is.
+//! What has no other way has the headroom to itself: a view through dma-bufs, a range, a
+//! stand-in, and a twin where no device needs imported pages mapped from their files
+//! ([`Reach::Whole`]). A device lend's pages are mapped from their files only short of the
+//! headroom: past it the device declines the frame, which the CPU copies instead
+//! (`super::import`'s `pages_from_files`).
 //!
 //! What would pass the budget first folds the views' runs mapped from their files that no import
 //! a device may pin holds back into dma-bufs (`super::vm::fold_idle`), a mapping per 4 MiB of
@@ -40,8 +42,6 @@
 
 use std::sync::Once;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 
 use super::files;
 
@@ -65,9 +65,9 @@ pub(super) const RESERVE: u64 = 16_384;
 /// The mappings kept below the budget for what has no way but mappings of its own, where the
 /// library chooses a view's or an import's mappings ([`claim`]): views through dma-bufs, each a
 /// mapping per 4 MiB of scattered pages at udmabuf's stock `list_limit` and one at each end
-/// (`super::vm`'s `map_through`), the ranges views are made of, IOSurface stand-ins' memory,
-/// rebinds' twins, and the pages rebinds and lends map from their files ([`Reach::Whole`]),
-/// which no gate refuses. A margin,
+/// (`super::vm`'s `map_through`), the ranges views are made of, IOSurface stand-ins' memory, and
+/// twins where no device needs imported pages mapped from their files ([`Reach::Whole`]). A
+/// margin,
 /// as [`RESERVE`] is, sized from the views it is for: views through dma-bufs of all of a 16 GiB
 /// guest's pages take 4,096 mappings and two for each view, and the
 /// views held at the 3840 × 2160 death (RTX 5080 Laptop, 16 GiB guest, 2026-10-27), 391 surfaces
@@ -206,8 +206,8 @@ pub(super) enum Reach {
     /// Short of it by [`HEADROOM`]: for what has another way than mappings of its own, which it
     /// takes past that (module docs).
     ShortOfHeadroom,
-    /// All of it, the headroom included: for what has no other way, the pages of a rebind's or a
-    /// lend's import a device pins as they are mapped (`super::import`'s `no_room_to_unfold`).
+    /// All of it, the headroom included: for what has no other way, an import's twin where no
+    /// device needs imported pages mapped from their files (`super::import`'s `twin`).
     Whole,
 }
 
@@ -248,26 +248,6 @@ pub(super) fn admit(adding: u64, what: &'static str) -> bool {
         exhausted(what, adding, held, limit, 0, &mappings)
     });
     false
-}
-
-/// Ends the process where `what`, which has no other way than `adding` mappings of its own, was
-/// refused them by [`claim`] reaching the whole budget, in strict mode, where its refusal would
-/// be the runtime's: [`admit`]'s death.
-pub(super) fn exhausted_whole(adding: u64, what: &'static str) -> ! {
-    let held = held().saturating_add(CLAIMED.load(Ordering::Acquire));
-    die(what, adding, held, reread(), 0)
-}
-
-/// [`exhausted_whole`]'s death, `kept` mappings short of the budget.
-fn die(what: &str, adding: u64, held: u64, limit: u64, kept: u64) -> ! {
-    let (mappings, _) = super::vm::map_census();
-    fatal_with_detail(
-        DeathId::Platform {
-            kind: DeathKind::Abort,
-            call: "mmap",
-        },
-        &exhausted(what, adding, held, limit, kept, &mappings),
-    )
 }
 
 /// The line of [`admit`]'s refusal: `what` would add `adding` mappings to the `held` the views hold
@@ -426,14 +406,10 @@ mod tests {
         {
             let _limit = Limit::room(0);
             assert!(dies_at_the_budget(|| vm::allocate_aliasable(PAGE)));
-            assert!(dies_at_the_budget(|| import::import_view(p, PAGE, true)));
+            assert!(dies_at_the_budget(|| import::import_view(p, PAGE)));
             assert!(dies_at_the_budget(|| vm::OwnMemory::new(PAGE)));
         }
-        assert_ne!(
-            import::import_view(p, PAGE, true).at(),
-            p,
-            "a twin with room"
-        );
+        assert_ne!(import::import_view(p, PAGE).at(), p, "a twin with room");
         assert!(v.deallocate(at, 2 * PAGE).is_success());
     }
 
@@ -471,7 +447,7 @@ mod tests {
             crate::answer::relaxed(|| {
                 assert_eq!(vm::allocate_aliasable(PAGE).err(), Some(KernReturn(3)));
                 assert!(vm::OwnMemory::new(PAGE).is_none());
-                assert_eq!(import::import_view(p, PAGE, true).at(), p, "no twin");
+                assert_eq!(import::import_view(p, PAGE).at(), p, "no twin");
             });
         }
         assert_eq!(crate::answer::out_of_host_memory_count(), before + 4);

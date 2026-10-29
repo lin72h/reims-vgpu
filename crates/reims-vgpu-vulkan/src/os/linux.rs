@@ -12,6 +12,7 @@ pub mod dirty;
 mod dma_buf;
 mod files;
 mod hints;
+mod host_ram;
 mod import;
 mod surface;
 mod threads;

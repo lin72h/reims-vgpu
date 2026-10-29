@@ -334,7 +334,7 @@ fn no_copy_release(
     run: Option<rt::Deallocator>,
     site: backing::ImportSite,
 ) -> (NonNull<u8>, Option<rt::Deallocator>, rt::KeepAlive, bool) {
-    let view = crate::os::import_view(start, length, site.gated());
+    let view = crate::os::import_view(start, length);
     let imported = view.at();
     let kept = view.writes_kept();
     let (run, twin) = view.release(start, run);
@@ -633,7 +633,7 @@ impl VulkanDevice {
             // The runtime imports the pages as they are mapped, from their files on Linux where a
             // device needs them so (`crate::os::import_view`); writable, so no twin.
             let site = backing::ImportSite::SurfaceBase;
-            let view = crate::os::import_view(base, length, site.gated());
+            let view = crate::os::import_view(base, length);
             let traced = backing::ImportTrace::new(site, base, length, view.at());
             (base, backing::keep_alive((hold, view, traced)))
         } else {

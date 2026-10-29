@@ -77,10 +77,10 @@
 //! views' gate about, maps them from their files only short of that headroom, the views no import
 //! holds folded back first where that may free some ([`fold_short_due`]); past it the gate
 //! refuses them, and the runtime makes the buffer or heap over a copy of them, which takes no
-//! mapping (`super::import`'s `import_gate`). A rebind's and a device lend's, which no gate
-//! refuses and which have no other way, map them from their files into the headroom, and only past
-//! the whole budget are handed over as mapped, which such a device refuses (`super::import`'s
-//! `no_room_to_unfold`).
+//! mapping (`super::import`'s `import_gate`); a rebind's alike, which the runtime then makes over
+//! a copy too. A device lend's maps them short of the headroom alone: past it the device declines
+//! the frame, which the CPU copies into the guest's buffer instead (`super::import`'s
+//! `pages_from_files`).
 //!
 //! **Folding back.** At the views' budget, before anything is refused, the views' runs mapped
 //! from their files that no import a device may pin holds (`super::import`'s `Pinned`) are mapped
@@ -875,16 +875,16 @@ fn through(
 
 /// Maps what of `first..end` is mapped through dma-bufs from its files instead, for an import of
 /// those bytes by their pointer (module docs, "Imports of views"); refused maps are logged, and
-/// leave those bytes as they were. Where the mappings would pass as far into the views' budget as
-/// `reach` lets the import ([`budget::claim`]), nothing is mapped, and the answer is how many they
-/// are, for the caller's refusal (`super::import`'s `no_room_to_unfold`). One at a time, so two
+/// leave those bytes as they were. Where the mappings would come within the headroom of the
+/// views' budget ([`budget::claim`]), nothing is mapped, and the answer is how many they are: the
+/// views' gate then refuses the import, or a lend's device declines it. One at a time, so two
 /// imports of the same pages map them once.
-pub(crate) fn unfold(first: u64, end: u64, reach: budget::Reach) -> Result<(), u64> {
-    reclaiming(|| unfold_once(first, end, reach))
+pub(crate) fn unfold(first: u64, end: u64) -> Result<(), u64> {
+    reclaiming(|| unfold_once(first, end))
 }
 
 /// [`unfold`], once: what a refused map leaves through dma-bufs a second try maps.
-fn unfold_once(first: u64, end: u64, reach: budget::Reach) -> Result<(), u64> {
+fn unfold_once(first: u64, end: u64) -> Result<(), u64> {
     static UNFOLDING: reims_vgpu_core::sync::Mutex<()> = reims_vgpu_core::sync::Mutex::new(());
     let _one = UNFOLDING.lock();
     let mut held = views();
@@ -894,19 +894,13 @@ fn unfold_once(first: u64, end: u64, reach: budget::Reach) -> Result<(), u64> {
     }
     let mut adding = mappings_added(&pieces);
     // Held until the pieces are recorded, which counts them. An import folds the views no import
-    // holds first, its own pages among those held (module docs): one with no other way always,
-    // a gated one where a fold may free something since the last ([`fold_short`]).
+    // holds first, its own pages among those held (module docs), where a fold may free something
+    // since the last ([`fold_short`]).
+    let reach = budget::Reach::ShortOfHeadroom;
     let mut claim = budget::claim(adding, reach);
-    let fold = match reach {
-        budget::Reach::Whole => true,
-        budget::Reach::ShortOfHeadroom => claim.is_none() && fold_short_due(),
-    };
-    if claim.is_none() && fold {
+    if claim.is_none() && fold_short_due() {
         drop(held);
-        match reach {
-            budget::Reach::Whole => drop(fold_idle()),
-            budget::Reach::ShortOfHeadroom => fold_short(),
-        }
+        fold_short();
         held = views();
         pieces = files::through_pieces(first, end);
         if pieces.is_empty() {

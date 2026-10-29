@@ -119,8 +119,10 @@ impl DeviceLend {
 
     /// A new hold on the surface's memory, which keeps [`Self::first`]'s bytes mapped while it
     /// lives, the surface and the lend gone or not, and holds no reference of the surface. The
-    /// bytes are mapped from their files, as a device given their address pins them as they are
-    /// mapped (`super::import::pages_from_files`).
+    /// bytes are mapped from their files short of the headroom of the views' budget, as a device
+    /// given their address pins them as they are mapped; past it they stay as they are, the device
+    /// refuses to register them, and the session copies the frame on the CPU instead
+    /// (`super::import::pages_from_files`).
     pub fn hold(&self) -> Box<dyn Send + Sync> {
         let pinned = super::import::pages_from_files(self.first, self.length);
         Box::new((self.holder.hold(), pinned))

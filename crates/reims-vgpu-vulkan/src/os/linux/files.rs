@@ -83,13 +83,15 @@ impl Through {
     }
 }
 
-/// A registration: `first..end` shows `backing`, read and write, `count` times registered.
+/// A registration: `first..end` shows `backing`, read and write, `count` times registered, `ram`
+/// of them as the guest's RAM ([`lease_guest_memory`]).
 #[derive(Debug)]
 struct Registered {
     first: u64,
     end: u64,
     backing: Backing,
     count: usize,
+    ram: usize,
 }
 
 /// One piece of a range as the table resolves it: `length` bytes, `at` bytes into the range,
@@ -177,6 +179,18 @@ impl Table {
     /// The registration holding byte `at`.
     fn registered_at(&self, at: u64) -> Option<&Registered> {
         self.registered.iter().find(|r| r.first <= at && at < r.end)
+    }
+
+    /// Where the byte at `offset` of the file `fd` lies in a range of the guest's RAM a lease
+    /// registered: its host address there, and the bytes from it to the range's end.
+    fn ram_at(&self, fd: &Arc<OwnedFd>, offset: u64) -> Option<(u64, u64)> {
+        (self.registered.iter())
+            .filter(|r| r.ram > 0 && Arc::ptr_eq(&r.backing.fd, fd))
+            .find_map(|r| {
+                let into = offset.checked_sub(r.backing.offset)?;
+                let length = r.end - r.first;
+                (into < length).then(|| (r.first + into, length - into))
+            })
     }
 
     /// The file behind byte `at`: the run or registration holding it, the file offset of `at`, its
@@ -494,12 +508,23 @@ pub(crate) struct Registration {
     first: u64,
     end: u64,
     backing: Backing,
+    /// Whether it registers a range of the guest's RAM ([`lease_guest_memory`]).
+    ram: bool,
 }
 
 impl Registration {
     /// Registers `length` bytes from `first` as showing `backing`: counted again where the same
     /// bytes are registered over the same file and offset.
     pub(crate) fn new(first: u64, length: u64, backing: Backing) -> Registration {
+        Registration::made(first, length, backing, false)
+    }
+
+    /// [`Registration::new`], of a range of the guest's RAM.
+    fn guest_ram(first: u64, length: u64, backing: Backing) -> Registration {
+        Registration::made(first, length, backing, true)
+    }
+
+    fn made(first: u64, length: u64, backing: Backing, ram: bool) -> Registration {
         let end = first.saturating_add(length);
         let mut table = TABLE.lock();
         match table
@@ -507,20 +532,52 @@ impl Registration {
             .iter_mut()
             .find(|r| r.is(first, end, &backing))
         {
-            Some(r) => r.count += 1,
+            Some(r) => {
+                r.count += 1;
+                r.ram += usize::from(ram);
+            }
             None => table.registered.push(Registered {
                 first,
                 end,
                 backing: backing.clone(),
                 count: 1,
+                ram: usize::from(ram),
             }),
         }
         Registration {
             first,
             end,
             backing,
+            ram,
         }
     }
+}
+
+/// The guest's RAM behind `length` bytes from `first`, as the leases registered it: runs of the
+/// RAM's own host addresses, each an address and a length, in the bytes' order, neighbours that
+/// follow on joined; `None` where a byte shows no page of the guest's RAM (memory of the
+/// library's own, a file of zeros, an IOSurface stand-in's), shows nothing, or is mapped without
+/// write permission: a device pins imported pages for writing, so read-only memory keeps the
+/// imports it has (`super::import`'s module docs).
+pub(crate) fn guest_ram_runs(first: u64, length: u64) -> Option<Vec<(u64, u64)>> {
+    let end = first.checked_add(length)?;
+    let table = TABLE.lock();
+    let mut runs: Vec<(u64, u64)> = Vec::new();
+    let mut at = first;
+    while at < end {
+        let (fd, offset, prot, to) = table.file_at(at, end)?;
+        if prot & libc::PROT_WRITE == 0 {
+            return None;
+        }
+        let (host, room) = table.ram_at(fd, offset)?;
+        let take = (to - at).min(room);
+        match runs.last_mut() {
+            Some(last) if last.0 + last.1 == host => last.1 += take,
+            _ => runs.push((host, take)),
+        }
+        at += take;
+    }
+    Some(runs)
 }
 
 /// The guest's RAM registered while a device made over it lives: the `guest_memory` lease its
@@ -528,6 +585,9 @@ impl Registration {
 /// guest's pages are made of these files.
 #[derive(Debug)]
 pub struct GuestMemoryLease {
+    /// The RAM as the devices that take it whole are handed it (`super::host_ram`), let go of
+    /// first.
+    _ram: Arc<super::host_ram::LeasedRam>,
     _registrations: Vec<Registration>,
     /// The ranges registered for the device's dirty log (`super::dirty`).
     _dirty: Option<super::dirty::Registered>,
@@ -544,6 +604,7 @@ pub fn lease_guest_memory(
 ) -> GuestMemoryLease {
     let ranges: Vec<GuestRamFile> = ranges.into_iter().collect();
     let dirty = dirty.map(|log| super::dirty::register(&ranges, &log));
+    let ram: Vec<(u64, u64)> = ranges.iter().map(|r| (r.host, r.length)).collect();
     let registrations: Vec<Registration> = ranges
         .into_iter()
         .map(|r| {
@@ -551,7 +612,7 @@ pub fn lease_guest_memory(
                 fd: r.fd,
                 offset: r.offset,
             };
-            Registration::new(r.host, r.length, backing)
+            Registration::guest_ram(r.host, r.length, backing)
         })
         .collect();
     let guest_ram = registrations
@@ -560,6 +621,7 @@ pub fn lease_guest_memory(
         .fold(0u64, u64::saturating_add);
     super::budget::warn_if_short(guest_ram);
     GuestMemoryLease {
+        _ram: super::host_ram::lease(&ram, dirty.is_some()),
         _registrations: registrations,
         _dirty: dirty,
     }
@@ -582,6 +644,7 @@ impl Drop for Registration {
         {
             let r = &mut table.registered[at];
             r.count -= 1;
+            r.ram -= usize::from(self.ram);
             if r.count == 0 {
                 table.registered.remove(at);
             }
@@ -713,6 +776,81 @@ mod tests {
         drop(lease);
         assert!(pieces(base, 0x1000).is_none());
         assert!(pieces(base + 0x10_000, 0x1000).is_none());
+    }
+
+    /// The guest's RAM behind a view resolves to the leased ranges' own addresses, a run per stretch
+    /// that follows on in one range, in the view's order; bytes of other memory resolve to none
+    #[test]
+    fn a_views_bytes_resolve_to_the_guests_ram() {
+        let f = file();
+        let other = file();
+        let base = 0x7e00_0000_0000;
+        let ram = |host, length, offset| GuestRamFile {
+            host,
+            guest: offset,
+            length,
+            fd: Arc::clone(&f),
+            offset,
+        };
+        let lease = lease_guest_memory(
+            [ram(base, 0x4000, 0), ram(base + 0x10_000, 0x4000, 0x4000)],
+            None,
+        );
+        let backing = |offset| Backing {
+            fd: Arc::clone(&f),
+            offset,
+        };
+        // A view of five pages: the second range's first two, then the first range's last page,
+        // then its first two backwards.
+        let view = base + 0x40_000;
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        record(view, 0x2000, backing(0x4000), rw);
+        record(view + 0x2000, 0x1000, backing(0x3000), rw);
+        record(view + 0x3000, 0x1000, backing(0x1000), rw);
+        record(view + 0x4000, 0x1000, backing(0), rw);
+        assert_eq!(
+            guest_ram_runs(view + 0x800, 0x4000),
+            Some(vec![
+                (base + 0x10_800, 0x1800),
+                (base + 0x3000, 0x1000),
+                (base + 0x1000, 0x1000),
+                (base, 0x800)
+            ])
+        );
+        // The RAM's own bytes resolve to themselves, across a page.
+        assert_eq!(
+            guest_ram_runs(base + 0xff0, 0x20),
+            Some(vec![(base + 0xff0, 0x20)])
+        );
+        // A read-only page of the RAM is left out, as is a page of another file, or of nothing.
+        protect(view + 0x2000, 0x1000, libc::PROT_READ);
+        assert_eq!(guest_ram_runs(view, 0x3000), None);
+        protect(view + 0x2000, 0x1000, rw);
+        record(
+            view + 0x5000,
+            0x1000,
+            Backing {
+                fd: Arc::clone(&other),
+                offset: 0,
+            },
+            rw,
+        );
+        assert_eq!(guest_ram_runs(view + 0x4000, 0x2000), None);
+        assert_eq!(guest_ram_runs(view + 0x6000, 0x1000), None);
+        // A stand-in's registration, of a file of its own, is no RAM either.
+        let stand_in = Registration::new(
+            base + 0x80_000,
+            0x1000,
+            Backing {
+                fd: Arc::clone(&other),
+                offset: 0,
+            },
+        );
+        assert_eq!(guest_ram_runs(base + 0x80_000, 0x1000), None);
+        drop(stand_in);
+        drop(lease);
+        assert_eq!(guest_ram_runs(view, 0x1000), None);
+        forget(view, 0x6000);
     }
 
     /// The table counts its runs' mappings as the kernel holds them: neighbours in one file at
