@@ -71,7 +71,9 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    The VM boots into macOS Recovery. Open Disk Utility, erase the VM's disk (QEMU HARDDISK Media)
    as APFS, and pick Reinstall macOS; with the offline installer, run
    `sh /Volumes/Installer/install-macos.sh` in Terminal instead. Once macOS is installed,
-   `reims-ctl eject mac` takes the installer out. Downloads are kept for your next VM, in
+   `reims-ctl eject mac` takes the installer out. While the installer is in, the VM runs without
+   video acceleration, because macOS 26's Recovery hangs while it starts up with it on; it comes
+   back once you eject the installer. Downloads are kept for your next VM, in
    `~/.local/share/reims-ctl/installers` (delete them there to get the space back, once your VMs'
    installers are ejected), and an interrupted one picks up where it stopped.
 
@@ -87,7 +89,9 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    1. Turn on the VM's boot selection, so that OpenCore shows its picker: in reims-ctl, press
       `e` on the VM, switch **Boot selection** on and save (or run
       `reims-ctl update-opencore NAME --boot-selection`). It's off by default, and then the VM
-      boots straight into macOS.
+      boots straight into macOS. On macOS 26, switch **Video acceleration** off there too (or run
+      `reims-ctl set NAME --video-acceleration false`): with it on, Recovery hangs while it
+      starts up.
    2. Start the VM, and pick the Recovery entry in OpenCore's picker before it boots macOS (it
       waits 5 seconds; any arrow key stops the countdown, and Space shows the entry if it's
       hidden).
@@ -100,8 +104,9 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
       The VM restarts only if every step worked. If it doesn't, read the error: the setting
       wasn't saved, and macOS will keep crashing until it is. Don't drop the `chmod`: without it,
       macOS can't read the setting.
-   4. Pick macOS in the picker. The desktop should come up. You can turn the boot selection off
-      again the same way.
+   4. Pick macOS in the picker. The desktop should come up. You can turn the boot selection off,
+      and video acceleration back on, the same way; both take effect the next time the VM starts.
+      Whenever you boot Recovery later, switch video acceleration off first.
 
    If you already have a desktop, run this in its Terminal instead, then restart:
 
